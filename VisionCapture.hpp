@@ -32,6 +32,12 @@ constructor_args:
       type: "aruco"
       dictionary: "DICT_5X5_100"
       marker_length_m: 0.04
+    camera_calibration:
+      enabled: false
+      marker_size_mm: 25.0
+      cols: 8
+      rows: 6
+      auto_save_views: 120
     filter:
       require_synced_imu: true
       max_image_imu_dt_us: 2000
@@ -74,6 +80,7 @@ depends:
 
 #include "CameraFrameSync.hpp"
 #include "VisionPreview.hpp"
+#include "VisionCaptureCameraCalibration.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
 #include "logger.hpp"
@@ -200,6 +207,15 @@ class VisionCapture : public LibXR::Application
     uint32_t max_image_imu_dt_us = 2000;
   };
 
+  struct CameraCalibrationParams
+  {
+    bool enabled = false;
+    double marker_size_mm = 25.0;
+    int cols = 8;
+    int rows = 6;
+    uint32_t auto_save_views = 120;
+  };
+
   struct Config
   {
     std::string_view mode = "record";
@@ -208,6 +224,7 @@ class VisionCapture : public LibXR::Application
     RecordParams record{};
     VisionPreview::RuntimeParam preview{};
     BoardParams board{};
+    CameraCalibrationParams camera_calibration{};
     FilterParams filter{};
   };
 
@@ -221,6 +238,7 @@ class VisionCapture : public LibXR::Application
     detector_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     preview_.Start(cfg_.preview);
     PrepareOutput();
+    StartCameraCalibrationIfNeeded();
     worker_thread_.Create(this, WorkerThreadFun, "VisionCapture",
                           VisionCaptureDetail::kWorkerStackSize,
                           LibXR::Thread::Priority::MEDIUM);
@@ -321,6 +339,30 @@ class VisionCapture : public LibXR::Application
     out << "\n";
   }
 
+  void StartCameraCalibrationIfNeeded()
+  {
+    const bool calibration_mode = cfg_.mode == "calibrate_camera";
+    if (!calibration_mode && !cfg_.camera_calibration.enabled)
+    {
+      return;
+    }
+
+    std::ostringstream marker;
+    marker << std::setprecision(10) << cfg_.camera_calibration.marker_size_mm;
+    const bool started = camera_calibration_.Start(
+        marker.str(), cfg_.camera_calibration.cols,
+        cfg_.camera_calibration.rows, session_name_);
+    if (!started)
+    {
+      XR_LOG_ERROR("VisionCapture camera calibration failed to start");
+      return;
+    }
+    XR_LOG_INFO("VisionCapture camera calibration enabled: marker=%.3fmm board=%dx%d auto_save_views=%u",
+                static_cast<float>(cfg_.camera_calibration.marker_size_mm),
+                cfg_.camera_calibration.cols, cfg_.camera_calibration.rows,
+                static_cast<unsigned>(cfg_.camera_calibration.auto_save_views));
+  }
+
   bool AcceptByRate(uint64_t timestamp_us)
   {
     if (cfg_.record.max_fps <= 0.0)
@@ -374,6 +416,7 @@ class VisionCapture : public LibXR::Application
       boards_detected_.fetch_add(1);
     }
     SubmitPreview(image, detection);
+    ProcessCameraCalibration(image, image_ts);
 
     if (!cfg_.record.enabled || !AcceptByRate(image_ts))
     {
@@ -390,6 +433,22 @@ class VisionCapture : public LibXR::Application
     WriteMetadata(total_saved_frames_, image_ts, imu_ts, dt_us, frame.imu,
                   image_path, detection);
     frames_saved_.fetch_add(1);
+  }
+
+  void ProcessCameraCalibration(const cv::Mat& image, uint64_t image_ts)
+  {
+    const bool calibration_mode = cfg_.mode == "calibrate_camera";
+    if (!calibration_mode && !cfg_.camera_calibration.enabled)
+    {
+      return;
+    }
+    camera_calibration_.ProcessFrame(image.data, image_ts);
+    if (cfg_.camera_calibration.auto_save_views != 0 &&
+        camera_calibration_.SaveAndStopIfReady(
+            cfg_.camera_calibration.auto_save_views))
+    {
+      XR_LOG_PASS("VisionCapture camera calibration auto-saved");
+    }
   }
 
   struct Detection
@@ -499,6 +558,7 @@ class VisionCapture : public LibXR::Application
 
   cv::aruco::Dictionary dictionary_{};
   cv::aruco::DetectorParameters detector_params_{};
+  VisionCaptureCameraCalibration<CameraInfoV> camera_calibration_{};
 
   std::string session_name_{};
   std::filesystem::path output_dir_{};
