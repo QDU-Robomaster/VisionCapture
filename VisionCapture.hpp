@@ -319,9 +319,9 @@ class VisionCapture : public LibXR::Application
     uint32_t max_frames = 0;
     /// 是否保存图像文件。
     bool save_images = true;
-    /// 是否保存 metadata.csv。
+    /// 是否保存 samples.csv。
     bool save_metadata = true;
-    /// 是否保存每帧附近的原始 IMU 数据。
+    /// 是否在 samples.csv 中写入同步 IMU 数据。
     bool save_raw_imu = true;
     /// CSV 每写入多少行刷盘一次。
     uint32_t flush_every_n = 1;
@@ -417,7 +417,73 @@ class VisionCapture : public LibXR::Application
    */
   struct Config
   {
-    /// 运行模式：`record` 或 `calibrate_camera`。
+    /**
+     * @brief 默认配置。
+     */
+    Config() = default;
+
+    /**
+     * @brief 供只填写基础配置项的生成代码使用。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           CameraCalibrationParams camera_calibration_in, FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          camera_calibration(camera_calibration_in),
+          filter(filter_in)
+    {
+    }
+
+    /**
+     * @brief 供填写 calibration_sampling 的生成代码使用。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           CameraCalibrationParams camera_calibration_in,
+           CalibrationSamplingParams calibration_sampling_in,
+           FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          camera_calibration(camera_calibration_in),
+          calibration_sampling(calibration_sampling_in),
+          filter(filter_in)
+    {
+    }
+
+    /**
+     * @brief 完整配置。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           CameraCalibrationParams camera_calibration_in,
+           CalibrationSamplingParams calibration_sampling_in,
+           ControlParams control_in, FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          camera_calibration(camera_calibration_in),
+          calibration_sampling(calibration_sampling_in),
+          control(control_in),
+          filter(filter_in)
+    {
+    }
+
+    /// 运行模式：`record`、`calibrate_camera`、`calibrate_handeye` 或 `calibrate`。
     std::string_view mode = "record";
     /// 输出根目录。
     std::string_view output_dir = "runs/vision_capture";
@@ -449,6 +515,7 @@ class VisionCapture : public LibXR::Application
         dictionary_(cv::aruco::getPredefinedDictionary(
             VisionCaptureDetail::ArucoDictionaryId(cfg_.board.dictionary)))
   {
+    NormalizeCalibrationConfig();
     detector_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     preview_.Start(cfg_.preview);
     sampling_running_.store(cfg_.calibration_sampling.auto_start,
@@ -619,19 +686,18 @@ class VisionCapture : public LibXR::Application
    */
   void SolveCurrentCalibration()
   {
-    const bool camera_mode = cfg_.mode == "calibrate_camera" ||
-                             cfg_.camera_calibration.enabled;
-    if (camera_mode)
+    bool solved_camera = false;
+    if (ShouldRunCameraCalibration())
     {
       if (camera_calibration_.SaveAndStop())
       {
         XR_LOG_PASS("VisionCapture control: camera calibration solved");
+        solved_camera = true;
       }
       else
       {
         XR_LOG_WARN("VisionCapture control: camera calibration solve failed");
       }
-      return;
     }
 
     std::size_t samples = 0;
@@ -639,8 +705,32 @@ class VisionCapture : public LibXR::Application
       std::lock_guard<std::mutex> lock(sampling_mutex_);
       samples = accepted_calibration_samples_.size();
     }
-    XR_LOG_WARN("VisionCapture control: handeye solver is not implemented yet, accepted_samples=%u",
-                static_cast<unsigned>(samples));
+    if (IsCalibrationDatasetMode())
+    {
+      XR_LOG_WARN("VisionCapture control: handeye solver is not implemented yet, accepted_samples=%u",
+                  static_cast<unsigned>(samples));
+    }
+    else if (!solved_camera)
+    {
+      XR_LOG_WARN("VisionCapture control: no calibration solver active");
+    }
+  }
+
+  /**
+   * @brief 标定模式固定保存通过判稳的图像和同步 IMU 元数据。
+   */
+  void NormalizeCalibrationConfig()
+  {
+    if (!IsCalibrationDatasetMode())
+    {
+      return;
+    }
+    cfg_.record.enabled = true;
+    cfg_.record.max_fps = 0.0;
+    cfg_.record.save_images = true;
+    cfg_.record.save_metadata = true;
+    cfg_.record.save_raw_imu = true;
+    cfg_.record.flush_every_n = 1;
   }
 
   /**
@@ -730,8 +820,7 @@ class VisionCapture : public LibXR::Application
    */
   void StartCameraCalibrationIfNeeded()
   {
-    const bool calibration_mode = cfg_.mode == "calibrate_camera";
-    if (!calibration_mode && !cfg_.camera_calibration.enabled)
+    if (!ShouldRunCameraCalibration())
     {
       return;
     }
@@ -812,9 +901,9 @@ class VisionCapture : public LibXR::Application
     }
     SamplingDecision sampling = EvaluateCalibrationSampling(detection, frame.imu, dt_us);
     SubmitPreview(image, detection);
-    ProcessCameraCalibration(image, image_ts);
+    ProcessCameraCalibration(image, image_ts, sampling.accepted);
 
-    if (!cfg_.record.enabled)
+    if (!ShouldSaveFrames())
     {
       return;
     }
@@ -841,20 +930,38 @@ class VisionCapture : public LibXR::Application
   }
 
   /**
-   * @brief 当前模式是否只保存通过判稳的标定样本。
+   * @brief 当前模式是否按标定样本保存。
    */
   bool IsCalibrationDatasetMode() const
   {
-    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye";
+    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye" ||
+           cfg_.mode == "calibrate_camera" || cfg_.camera_calibration.enabled;
   }
 
   /**
-   * @brief 将当前帧交给相机内参标定器。
+   * @brief 当前配置是否需要运行相机内参标定器。
    */
-  void ProcessCameraCalibration(const cv::Mat& image, uint64_t image_ts)
+  bool ShouldRunCameraCalibration() const
   {
-    const bool calibration_mode = cfg_.mode == "calibrate_camera";
-    if (!calibration_mode && !cfg_.camera_calibration.enabled)
+    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_camera" ||
+           cfg_.camera_calibration.enabled;
+  }
+
+  /**
+   * @brief 当前配置是否保存图像和元数据。
+   */
+  bool ShouldSaveFrames() const
+  {
+    return cfg_.record.enabled || IsCalibrationDatasetMode();
+  }
+
+  /**
+   * @brief 将通过判稳的标定样本交给相机内参标定器。
+   */
+  void ProcessCameraCalibration(const cv::Mat& image, uint64_t image_ts,
+                                bool sample_accepted)
+  {
+    if (!ShouldRunCameraCalibration() || !sample_accepted)
     {
       return;
     }
@@ -875,9 +982,9 @@ class VisionCapture : public LibXR::Application
    */
   struct SamplingDecision
   {
-    /// 当前帧是否被接受为标定样本。
+    /// 当前帧是否通过判稳并保存为标定样本。
     bool accepted = false;
-    /// 接受或拒绝原因。
+    /// 判定原因。
     std::string reason = "not_evaluated";
     /// true 表示 PnP 求解成功。
     bool pnp_ok = false;
@@ -936,11 +1043,12 @@ class VisionCapture : public LibXR::Application
     }
 
     cv::Mat ids;
+    const cv::aruco::Dictionary& dictionary = SamplingDictionary();
 #if CV_VERSION_MAJOR >= 4 && CV_VERSION_MINOR >= 7
-    cv::aruco::ArucoDetector detector(dictionary_, detector_params_);
+    cv::aruco::ArucoDetector detector(dictionary, detector_params_);
     detector.detectMarkers(image, detection.marker_corners, ids);
 #else
-    cv::aruco::detectMarkers(image, dictionary_, detection.marker_corners, ids,
+    cv::aruco::detectMarkers(image, dictionary, detection.marker_corners, ids,
                              detector_params_);
 #endif
     if (!ids.empty())
@@ -950,8 +1058,7 @@ class VisionCapture : public LibXR::Application
       {
         detection.marker_ids_vec.push_back(ids.at<int>(i, 0));
       }
-      const auto board = VisionCaptureCalibrationBoard::MakeSingleArucoBoard(
-          cfg_.board.marker_length_m);
+      const auto board = SamplingBoard();
       VisionCaptureCalibrationBoard::CollectBoardPoints(detection.marker_corners,
                                              detection.marker_ids, board,
                                              detection);
@@ -962,6 +1069,40 @@ class VisionCapture : public LibXR::Application
                                       detection);
     }
     return detection;
+  }
+
+  /**
+   * @brief 当前采样使用的 ArUco 字典。
+   */
+  const cv::aruco::Dictionary& SamplingDictionary() const
+  {
+    return ShouldRunCameraCalibration() ? camera_sampling_dictionary_ : dictionary_;
+  }
+
+  /**
+   * @brief 当前采样使用的标定板三维点，单位 m。
+   */
+  VisionCaptureCalibrationBoard::BoardMap SamplingBoard() const
+  {
+    if (!ShouldRunCameraCalibration())
+    {
+      return VisionCaptureCalibrationBoard::MakeSingleArucoBoard(
+          cfg_.board.marker_length_m);
+    }
+
+    auto board = VisionCaptureCalibrationBoard::MakeGShangBoard(
+        cfg_.camera_calibration.marker_size_mm, cfg_.camera_calibration.cols,
+        cfg_.camera_calibration.rows);
+    for (auto& item : board)
+    {
+      for (auto& point : item.second)
+      {
+        point.x *= 0.001F;
+        point.y *= 0.001F;
+        point.z *= 0.001F;
+      }
+    }
+    return board;
   }
 
   /**
@@ -1003,10 +1144,12 @@ class VisionCapture : public LibXR::Application
     }
     try
     {
+      const int method = detection.object_points.size() == 4
+                             ? cv::SOLVEPNP_IPPE_SQUARE
+                             : cv::SOLVEPNP_ITERATIVE;
       const auto pose =
           VisionCaptureCalibrationBoard::EstimatePose(detection, CameraMatrix(),
-                                       DistortionCoefficients(),
-                                       cv::SOLVEPNP_IPPE_SQUARE);
+                                       DistortionCoefficients(), method);
       if (!pose.ok)
       {
         decision.reason = "pnp_failed";
@@ -1384,6 +1527,9 @@ class VisionCapture : public LibXR::Application
 
   /// OpenCV ArUco 字典。
   cv::aruco::Dictionary dictionary_{};
+  /// 相机内参标定采样使用的 ArUco original 字典。
+  cv::aruco::Dictionary camera_sampling_dictionary_{
+      cv::aruco::getPredefinedDictionary(cv::aruco::DICT_ARUCO_ORIGINAL)};
   /// OpenCV ArUco 检测参数。
   cv::aruco::DetectorParameters detector_params_{};
   /// 相机内参标定流程对象。
@@ -1399,13 +1545,13 @@ class VisionCapture : public LibXR::Application
   mutable std::mutex sampling_mutex_{};
   /// 最近若干帧稳定性计算窗口。
   std::deque<StableSample> stability_window_{};
-  /// 已接受的标定采样结果。
+  /// 已保存的判稳样本。
   std::vector<StableSample> accepted_calibration_samples_{};
-  /// 最近一次接受的样本。
+  /// 最近一次通过判稳的样本。
   StableSample last_accepted_sample_{};
   /// 保护最近一次采样状态文本。
   mutable std::mutex status_mutex_{};
-  /// 最近一次接受或拒绝原因。
+  /// 最近一次采样判定原因。
   std::string last_reject_reason_{"init"};
   /// 最近一次 PnP RMS，单位像素。
   double last_pnp_rms_px_{0.0};

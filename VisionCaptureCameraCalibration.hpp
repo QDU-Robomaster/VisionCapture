@@ -600,7 +600,7 @@ class VisionCaptureCameraCalibration
       return false;
     }
 
-    // 质量指标只对已经通过基础几何门槛的帧计算，减少无效帧的额外开销。
+    // 质量指标只对已经通过基础几何门槛的帧计算，减少无效帧的计算开销。
     VisionCaptureCalibrationBoard::FillQuality(image, CameraInfoV.width,
                                                CameraInfoV.height, observation);
     return true;
