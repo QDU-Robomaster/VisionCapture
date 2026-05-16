@@ -15,36 +15,65 @@ namespace VisionCaptureCalibrationBoard
 {
 using BoardMap = std::map<int, std::array<cv::Point3f, 4>>;
 
+/**
+ * @brief 一帧标定板检测结果。
+ */
 struct Observation
 {
+  /// 当前帧是否找到可用标定板角点。
   bool observed = false;
+  /// 本帧参与计算的 marker 数。
   int used_markers = 0;
+  /// 标定板平面单应性重投影 RMS，单位像素。
   double homography_rms = 0.0;
+  /// marker 区域拉普拉斯方差，用于粗略判断运动模糊。
   double sharpness_score = 0.0;
+  /// 标定板包围框中心 x，按图像宽度归一化。
   double center_x_norm = 0.0;
+  /// 标定板包围框中心 y，按图像高度归一化。
   double center_y_norm = 0.0;
+  /// 标定板包围框面积相对图像面积的平方根。
   double scale_norm = 0.0;
+  /// 标定板在图像中的平面内角度，范围为 [0, 180) 度。
   double angle_deg = 0.0;
+  /// 与 image_points 一一对应的标定板三维角点。
   std::vector<cv::Point3f> object_points;
+  /// 与 object_points 一一对应的图像角点。
   std::vector<cv::Point2f> image_points;
+  /// OpenCV ArUco 检测出的原始 marker 角点。
   std::vector<std::vector<cv::Point2f>> marker_corners;
+  /// 检测出的 marker id 列表。
   std::vector<int> marker_ids_vec;
+  /// OpenCV ArUco 检测出的 marker id 矩阵。
   cv::Mat marker_ids;
 };
 
+/**
+ * @brief 单帧 PnP 位姿估计结果。
+ */
 struct PoseEstimate
 {
+  /// true 表示 solvePnP 成功且完成重投影误差计算。
   bool ok = false;
+  /// PnP 重投影 RMS，单位像素。
   double reprojection_rms_px = 0.0;
+  /// OpenCV Rodrigues 旋转向量，表示标定板到相机的旋转。
   cv::Mat rvec;
+  /// 标定板到相机的平移，单位 m。
   cv::Mat tvec;
 };
 
+/**
+ * @brief 将浮点数限制到三角函数反解可接受的 [-1, 1]。
+ */
 inline double ClampUnit(double value)
 {
   return std::max(-1.0, std::min(1.0, value));
 }
 
+/**
+ * @brief 归一化标定板在图像中的平面内角度。
+ */
 inline double NormalizeBoardAngle(double angle_deg, const cv::Size2f& size)
 {
   if (size.width < size.height)
@@ -62,6 +91,9 @@ inline double NormalizeBoardAngle(double angle_deg, const cv::Size2f& size)
   return angle_deg;
 }
 
+/**
+ * @brief 计算两个标定板平面角之间的最小夹角。
+ */
 inline double AngleDeltaDeg(double lhs, double rhs)
 {
   double delta = std::fabs(lhs - rhs);
@@ -72,6 +104,9 @@ inline double AngleDeltaDeg(double lhs, double rhs)
   return delta > 90.0 ? 180.0 - delta : delta;
 }
 
+/**
+ * @brief 将支持的输入图像转换为灰度图。
+ */
 inline cv::Mat MakeGrayImage(const cv::Mat& image)
 {
   if (image.channels() == 1)
@@ -90,6 +125,9 @@ inline cv::Mat MakeGrayImage(const cv::Mat& image)
   return gray;
 }
 
+/**
+ * @brief 用平面单应性估计当前角点集合的重投影 RMS。
+ */
 inline double HomographyRms(const std::vector<cv::Point3f>& object_points,
                             const std::vector<cv::Point2f>& image_points)
 {
@@ -123,6 +161,9 @@ inline double HomographyRms(const std::vector<cv::Point3f>& object_points,
   return std::sqrt(sum2 / static_cast<double>(image_points.size()));
 }
 
+/**
+ * @brief 计算 marker 区域的拉普拉斯方差。
+ */
 inline double MarkerSharpnessScore(
     const cv::Mat& image, const std::vector<std::vector<cv::Point2f>>& corners)
 {
@@ -165,6 +206,9 @@ inline double MarkerSharpnessScore(
   return stddev[0] * stddev[0];
 }
 
+/**
+ * @brief 填充一帧标定板检测结果的质量指标。
+ */
 inline void FillQuality(const cv::Mat& image, uint32_t width, uint32_t height,
                         Observation& observation)
 {
@@ -196,6 +240,9 @@ inline void FillQuality(const cv::Mat& image, uint32_t width, uint32_t height,
   }
 }
 
+/**
+ * @brief 按 marker id 将检测角点整理成 OpenCV 标定所需点列。
+ */
 inline bool CollectBoardPoints(
     const std::vector<std::vector<cv::Point2f>>& corners, const cv::Mat& ids,
     const BoardMap& board, Observation& observation)
@@ -233,6 +280,9 @@ inline bool CollectBoardPoints(
   return observation.observed;
 }
 
+/**
+ * @brief 生成单个 ArUco marker 的四角三维坐标。
+ */
 inline BoardMap MakeSingleArucoBoard(double marker_length_m)
 {
   const float half = static_cast<float>(marker_length_m * 0.5);
@@ -244,6 +294,9 @@ inline BoardMap MakeSingleArucoBoard(double marker_length_m)
   return board;
 }
 
+/**
+ * @brief 生成 GShang 标定板每个 marker 的四角三维坐标。
+ */
 inline BoardMap MakeGShangBoard(double marker_mm, int cols, int rows,
                                 int marker_cells = 7, int square_cells = 9)
 {
@@ -274,6 +327,9 @@ inline BoardMap MakeGShangBoard(double marker_mm, int cols, int rows,
   return board;
 }
 
+/**
+ * @brief 计算给定位姿和相机参数下的重投影 RMS。
+ */
 inline double ReprojectionRms(const std::vector<cv::Point3f>& object_points,
                               const std::vector<cv::Point2f>& image_points,
                               const cv::Mat& rvec, const cv::Mat& tvec,
@@ -291,6 +347,9 @@ inline double ReprojectionRms(const std::vector<cv::Point3f>& object_points,
   return std::sqrt(sum2 / std::max<std::size_t>(1, image_points.size()));
 }
 
+/**
+ * @brief 对一帧标定板角点执行 solvePnP。
+ */
 inline PoseEstimate EstimatePose(const Observation& observation,
                                  const cv::Mat& camera_matrix,
                                  const cv::Mat& distortion, int method)

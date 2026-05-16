@@ -29,10 +29,10 @@
 #include <vector>
 
 /**
- * @brief VisionCapture 相机内参标定辅助器。
+ * @brief VisionCapture 相机内参标定器。
  *
- * VisionCapture 在 CameraFrameSync 后消费同步帧。本类保留旧 CameraBase 标定器的
- * GShang/ArUco 采样过滤、OpenCV 求解和质量报告输出逻辑。
+ * VisionCapture 在 CameraFrameSync 后消费同步帧。本类负责 GShang/ArUco
+ * 采样过滤、OpenCV 求解和质量报告输出。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 class VisionCaptureCameraCalibration
@@ -61,7 +61,7 @@ class VisionCaptureCameraCalibration
       CameraInfoV.encoding == CameraTypes::Encoding::MONO8;
 
   /**
-   * @brief 单次在线标定的参数快照。
+   * @brief 单次相机内参标定的参数快照。
    *
    * 这些参数在 Start() 时根据命令行和经验默认值生成，采样线程只读取快照；
    * 保存阶段也复制同一份配置，保证输出文件和采样判据一致。
@@ -99,7 +99,7 @@ class VisionCaptureCameraCalibration
   };
 
   /**
-   * @brief 启动一轮在线 ChArUco 标定。
+   * @brief 启动一轮 ChArUco 标定。
    *
    * @param marker_size_text marker 黑码边长，支持 `25mm` 或 `25`。
    * @param cols GShang 标定板列数。
@@ -174,10 +174,10 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 处理来自 VisionCapture::ProcessFrame() 的一帧图像。
    *
-   * 标定激活时，本函数无论是否真正跑检测都会吞掉图像，保证采样期间不向
-   * CameraFrameSync 发布相机图像；标定未激活时返回 false 让正常发布路径继续。
+   * 标定激活时，本函数无论是否真正跑检测都会接管图像；标定未激活时返回 false，
+   * 让常规记录流程继续处理当前帧。
    *
-   * @param data 指向当前图像缓冲区的首地址，生命周期由 CameraBase 当前帧保证。
+   * @param data 指向当前图像缓冲区的首地址，只在本次调用期间有效。
    * @param timestamp_us 当前帧的相机时间戳，单位 us。
    * @return true 表示该帧被标定流程接管，正常图像发布必须跳过。
    */
@@ -400,7 +400,7 @@ class VisionCaptureCameraCalibration
     uint64_t timestamp_us = 0;
   };
 
-  /// 单帧标定板观测，包含 marker 角点、标定点集和在线质量指标。
+  /// 单帧标定板观测，包含 marker 角点、标定点集和质量指标。
   using Observation = VisionCaptureCalibrationBoard::Observation;
 
   /**
@@ -442,9 +442,9 @@ class VisionCaptureCameraCalibration
   /// PrepareFrame() 对当前帧给出的发布路径决策。
   enum class FrameAction
   {
-    /// 标定未激活，交还给 CameraBase 正常发布。
+    /// 标定未激活，当前帧继续进入常规记录流程。
     PUBLISH,
-    /// 标定激活但本帧不做检测，吞掉帧以切断下游图像发布。
+    /// 标定激活但本帧不做检测，当前帧不保存。
     SWALLOW,
     /// 标定激活且当前帧需要进入 OpenCV 检测。
     PROCESS,
@@ -513,8 +513,8 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 在锁内完成帧闸门决策，并为需要检测的帧生成快照。
    *
-   * 这里是 CameraBase 发布路径和标定路径的分界点：只要 active_ 为 true，帧就被吞掉；
-   * 只有抽帧命中的帧才继续跑 OpenCV 检测。
+   * 只要 active_ 为 true，当前帧就由标定流程接管；只有抽帧命中的帧才继续跑
+   * OpenCV 检测。
    */
   FrameAction PrepareFrame(const uint8_t* data, uint64_t timestamp_us,
                            FrameSnapshot& snapshot)
@@ -801,10 +801,10 @@ class VisionCaptureCameraCalibration
   }
 
   /**
-   * @brief 生成 GShang 在线工具对应的 ChArUco 三维角点表。
+   * @brief 生成 GShang 工具对应的 ChArUco 三维角点表。
    *
    * GShang 工具在 (row + col) 为奇数的棋盘格中放置 ArUco-original 5-bit 标记。
-   * 该工具里的 markerSize 不是完整方格宽度：5-bit 标记外侧还有白边和棋盘边界，
+   * 该工具里的 markerSize 不是完整方格宽度：5-bit 标记外侧还有白边和棋盘留边，
    * 因此实际方格宽度为 square_mm = marker_mm * 9 / 7。
    */
   static BoardMap MakeGShangMarkerMap(const Config& config)
@@ -814,11 +814,6 @@ class VisionCaptureCameraCalibration
         gshang_square_cells);
   }
 
-  /**
-   * @brief 填充检测帧的清晰度、图像中心、尺度和旋转角质量指标。
-   *
-   * 这些指标不直接参与 OpenCV 标定，但用于在线采样去模糊、去重复，以及 views.csv 复盘。
-   */
   /**
    * @brief 判断当前观测是否和已有样本过近。
    *
@@ -882,7 +877,7 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 调用 OpenCV calibrateCamera 计算内参、畸变和每视角外参。
    *
-   * @return true 保留为调用语义占位；OpenCV 异常由上层捕获。
+   * @return true 表示 OpenCV 求解完成；OpenCV 异常由上层捕获。
    */
   static bool CalibrateViews(const std::vector<View>& views,
                              cv::Mat& camera_matrix, cv::Mat& distortion,
@@ -1159,7 +1154,7 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 保存求解前再次按清晰度过滤样本。
    *
-   * 在线阶段会动态更新最佳清晰度；保存阶段重新计算阈值，保证最终求解用的是整轮样本中
+   * 采样阶段会动态更新最佳清晰度；保存阶段重新计算阈值，保证最终求解用的是整轮样本中
    * 相对清晰的一组视角。
    */
   static std::vector<View> FilterBySharpness(const std::vector<View>& views,
@@ -1536,7 +1531,7 @@ class VisionCaptureCameraCalibration
   cv::aruco::Dictionary dictionary_{};
   /// 当前 ArUco 检测参数实例。
   cv::aruco::DetectorParameters detector_params_{};
-  /// 已通过在线过滤并等待保存求解的点集；完整 debug 图在接受时立即写入磁盘。
+  /// 已通过采样过滤并等待保存求解的点集；完整 debug 图在接受时立即写入磁盘。
   std::vector<View> accepted_views_{};
 
   /// 本轮标定输出根目录。

@@ -110,15 +110,24 @@ depends:
 
 namespace VisionCaptureDetail
 {
+/// 同步帧消费线程栈大小。
 inline constexpr size_t kWorkerStackSize = 8192;
+/// 标准输入命令线程栈大小。
 inline constexpr size_t kControlStackSize = 4096;
+/// 等待 CameraFrameSync 同步帧的超时时间，单位 ms。
 inline constexpr uint32_t kSyncWaitTimeoutMs = 1000;
 
+/**
+ * @brief 将 string_view 复制为拥有存储的 std::string。
+ */
 inline std::string ToString(std::string_view value)
 {
   return std::string(value.data(), value.size());
 }
 
+/**
+ * @brief 生成默认采集会话名。
+ */
 inline std::string MakeTimestampSessionName()
 {
   const auto now = std::chrono::system_clock::now();
@@ -134,6 +143,9 @@ inline std::string MakeTimestampSessionName()
   return out.str();
 }
 
+/**
+ * @brief 将配置中的 ArUco 字典名转换为 OpenCV 枚举值。
+ */
 inline int ArucoDictionaryId(std::string_view name)
 {
   if (name == "DICT_4X4_50") return cv::aruco::DICT_4X4_50;
@@ -146,6 +158,11 @@ inline int ArucoDictionaryId(std::string_view name)
   return cv::aruco::DICT_5X5_100;
 }
 
+/**
+ * @brief 将 CameraFrameSync 图像帧封装为 OpenCV Mat。
+ *
+ * 返回的 Mat 不拥有像素内存，只在传入图像帧有效期间使用。
+ */
 template <CameraTypes::CameraInfo CameraInfoV>
 cv::Mat MakeImageView(
     const typename CameraFrameSync<CameraInfoV>::ImageFrame& image)
@@ -174,6 +191,9 @@ cv::Mat MakeImageView(
   }
 }
 
+/**
+ * @brief 将输入图像转换为 BGR 预览图。
+ */
 inline cv::Mat MakeBgrForPreview(const cv::Mat& image)
 {
   if (image.empty())
@@ -196,8 +216,14 @@ inline cv::Mat MakeBgrForPreview(const cv::Mat& image)
   return bgr;
 }
 
+/**
+ * @brief 弧度转角度。
+ */
 inline double RadToDeg(double rad) { return rad * 180.0 / CV_PI; }
 
+/**
+ * @brief 计算三维数组的二范数。
+ */
 inline double Norm3(const std::array<float, 3>& value)
 {
   const double x = value[0];
@@ -206,12 +232,18 @@ inline double Norm3(const std::array<float, 3>& value)
   return std::sqrt(x * x + y * y + z * z);
 }
 
+/**
+ * @brief 将三维数组转换为 OpenCV Vec3d。
+ */
 inline cv::Vec3d ToVec3d(const std::array<float, 3>& value)
 {
   return {static_cast<double>(value[0]), static_cast<double>(value[1]),
           static_cast<double>(value[2])};
 }
 
+/**
+ * @brief 归一化 wxyz 顺序四元数。
+ */
 inline cv::Vec4d NormalizeQuatWxyz(const std::array<float, 4>& q)
 {
   const double w = q[0];
@@ -226,6 +258,9 @@ inline cv::Vec4d NormalizeQuatWxyz(const std::array<float, 4>& q)
   return {w / norm, x / norm, y / norm, z / norm};
 }
 
+/**
+ * @brief 计算两个四元数之间的最小旋转角。
+ */
 inline double QuatAngularDistanceDeg(const cv::Vec4d& lhs, const cv::Vec4d& rhs)
 {
   const double dot = std::fabs(lhs[0] * rhs[0] + lhs[1] * rhs[1] +
@@ -233,6 +268,9 @@ inline double QuatAngularDistanceDeg(const cv::Vec4d& lhs, const cv::Vec4d& rhs)
   return RadToDeg(2.0 * std::acos(VisionCaptureCalibrationBoard::ClampUnit(dot)));
 }
 
+/**
+ * @brief 计算两个 Rodrigues 旋转向量之间的最小旋转角。
+ */
 inline double RotationDistanceDeg(const cv::Mat& lhs_rvec,
                                   const cv::Mat& rhs_rvec)
 {
@@ -247,86 +285,163 @@ inline double RotationDistanceDeg(const cv::Mat& lhs_rvec,
 }
 }  // namespace VisionCaptureDetail
 
+/**
+ * @brief 同步图像和 IMU 采集模块。
+ *
+ * 模块从 CameraFrameSync 读取同步帧，可保存图像/IMU 元数据、显示预览、
+ * 执行相机内参标定采样，并筛选后续手眼标定所需的稳定样本。
+ */
 template <CameraTypes::CameraInfo CameraInfoV>
 class VisionCapture : public LibXR::Application
 {
  public:
+  /// 对应的 CameraFrameSync 类型。
   using Sync = CameraFrameSync<CameraInfoV>;
+  /// 同步后的图像帧类型。
   using ImageFrame = typename Sync::ImageFrame;
+  /// 同步后的 IMU 数据类型。
   using ImuStamped = typename Sync::ImuStamped;
+  /// 图像和 IMU 合包类型。
   using SyncedFrame = typename Sync::SyncedFrame;
 
+  /**
+   * @brief 同步帧记录配置。
+   */
   struct RecordParams
   {
+    /// 是否保存同步帧。
     bool enabled = true;
+    /// 图像文件扩展名，常用 `bmp` 或 `png`。
     std::string_view image_format = "bmp";
+    /// 记录帧率上限，0 表示不限制。
     double max_fps = 30.0;
+    /// 最多保存多少帧，0 表示不限制。
     uint32_t max_frames = 0;
+    /// 是否保存图像文件。
     bool save_images = true;
+    /// 是否保存 metadata.csv。
     bool save_metadata = true;
+    /// 是否保存每帧附近的原始 IMU 数据。
     bool save_raw_imu = true;
+    /// CSV 每写入多少行刷盘一次。
     uint32_t flush_every_n = 1;
   };
 
+  /**
+   * @brief 标定板检测配置。
+   */
   struct BoardParams
   {
+    /// 当前支持 `aruco`。
     std::string_view type = "aruco";
+    /// OpenCV ArUco 字典名称。
     std::string_view dictionary = "DICT_5X5_100";
+    /// 单个 marker 边长，单位 m。
     double marker_length_m = 0.04;
   };
 
+  /**
+   * @brief 同步帧过滤配置。
+   */
   struct FilterParams
   {
+    /// true 表示没有同步 IMU 的图像不保存。
     bool require_synced_imu = true;
+    /// 图像与 IMU 时间戳允许的最大差值，单位 us。
     uint32_t max_image_imu_dt_us = 2000;
   };
 
+  /**
+   * @brief 相机内参标定配置。
+   */
   struct CameraCalibrationParams
   {
+    /// 是否启用相机内参标定。
     bool enabled = false;
+    /// marker 黑码区域边长，单位 mm。
     double marker_size_mm = 25.0;
+    /// GShang 标定板棋盘列数。
     int cols = 8;
+    /// GShang 标定板棋盘行数。
     int rows = 6;
+    /// 自动求解前需要接受的视角数量。
     uint32_t auto_save_views = 120;
   };
 
+  /**
+   * @brief 标定采样判稳配置。
+   */
   struct CalibrationSamplingParams
   {
+    /// 是否启用判稳采样。
     bool enabled = true;
+    /// true 表示启动后立即开始采样。
     bool auto_start = true;
+    /// 计算稳定性时保留的最近样本数。
     uint32_t window_size = 8;
+    /// 两个接受样本之间的最小时间间隔，单位 us。
     uint64_t min_accept_interval_us = 500000;
+    /// PnP 重投影 RMS 上限，单位像素。
     double max_pnp_reprojection_rms_px = 2.0;
+    /// PnP 平移抖动上限，单位 m。
     double max_pnp_translation_jitter_m = 0.005;
+    /// PnP 旋转抖动上限，单位 deg。
     double max_pnp_rotation_jitter_deg = 1.0;
+    /// IMU 四元数抖动上限，单位 deg。
     double max_imu_rotation_jitter_deg = 0.8;
+    /// 陀螺仪模长上限，单位 deg/s。
     double max_gyro_norm_dps = 2.0;
+    /// 加速度模长与重力加速度差值上限，单位 m/s^2。
     double max_acc_norm_error_mps2 = 1.5;
+    /// 加速度模长抖动上限，单位 m/s^2。
     double max_acc_norm_jitter_mps2 = 0.5;
+    /// 加速度方向抖动上限，单位 deg。
     double max_acc_direction_jitter_deg = 2.0;
+    /// 与已接受样本相比需要达到的最小平移变化，单位 m。
     double min_sample_translation_delta_m = 0.03;
+    /// 与已接受样本相比需要达到的最小姿态变化，单位 deg。
     double min_sample_rotation_delta_deg = 5.0;
   };
 
+  /**
+   * @brief 本地命令配置。
+   */
   struct ControlParams
   {
+    /// true 时从标准输入读取 start/pause/reset/status 等命令。
     bool stdin_enabled = false;
   };
 
+  /**
+   * @brief VisionCapture 总配置。
+   */
   struct Config
   {
+    /// 运行模式：`record` 或 `calibrate_camera`。
     std::string_view mode = "record";
+    /// 输出根目录。
     std::string_view output_dir = "runs/vision_capture";
+    /// 会话名称；为空时自动使用时间戳。
     std::string_view session_name = "";
+    /// 同步帧记录配置。
     RecordParams record{};
+    /// 预览配置。
     VisionPreview::RuntimeParam preview{};
+    /// 标定板检测配置。
     BoardParams board{};
+    /// 相机内参标定配置。
     CameraCalibrationParams camera_calibration{};
+    /// 标定采样判稳配置。
     CalibrationSamplingParams calibration_sampling{};
+    /// 本地命令配置。
     ControlParams control{};
+    /// 同步帧过滤配置。
     FilterParams filter{};
   };
 
+  /**
+   * @brief 构造同步采集模块并启动工作线程。
+   */
   VisionCapture(LibXR::HardwareContainer&, LibXR::ApplicationManager& app,
                 Config cfg, Sync& sync)
       : cfg_(cfg),
@@ -352,6 +467,9 @@ class VisionCapture : public LibXR::Application
     app.Register(*this);
   }
 
+  /**
+   * @brief 周期输出采集、检测和采样计数。
+   */
   void OnMonitor() override
   {
     const uint64_t frames = frames_seen_.exchange(0);
@@ -372,6 +490,9 @@ class VisionCapture : public LibXR::Application
   }
 
  private:
+  /**
+   * @brief 从 CameraFrameSync 阻塞读取同步帧并交给 ProcessFrame()。
+   */
   static void WorkerThreadFun(VisionCapture* self)
   {
     XR_LOG_INFO("VisionCapture worker starting: image=%s imu=%s",
@@ -404,6 +525,9 @@ class VisionCapture : public LibXR::Application
     }
   }
 
+  /**
+   * @brief 从标准输入读取采样控制命令。
+   */
   static void ControlThreadFun(VisionCapture* self)
   {
     XR_LOG_INFO("VisionCapture stdin control ready: help/status/start/pause/reset/solve/snapshot");
@@ -415,6 +539,9 @@ class VisionCapture : public LibXR::Application
     XR_LOG_INFO("VisionCapture stdin control stopped: stdin closed");
   }
 
+  /**
+   * @brief 执行一条标准输入控制命令。
+   */
   void HandleControlCommand(std::string_view command)
   {
     while (!command.empty() &&
@@ -469,6 +596,9 @@ class VisionCapture : public LibXR::Application
     }
   }
 
+  /**
+   * @brief 清空判稳窗口和已接受样本。
+   */
   void ResetCalibrationSampling()
   {
     std::lock_guard<std::mutex> lock(sampling_mutex_);
@@ -484,6 +614,9 @@ class VisionCapture : public LibXR::Application
     }
   }
 
+  /**
+   * @brief 根据当前模式触发求解或打印样本状态。
+   */
   void SolveCurrentCalibration()
   {
     const bool camera_mode = cfg_.mode == "calibrate_camera" ||
@@ -510,6 +643,9 @@ class VisionCapture : public LibXR::Application
                 static_cast<unsigned>(samples));
   }
 
+  /**
+   * @brief 生成一行当前采样状态文本。
+   */
   std::string BuildStatusLine() const
   {
     std::size_t samples = 0;
@@ -529,6 +665,9 @@ class VisionCapture : public LibXR::Application
     return out.str();
   }
 
+  /**
+   * @brief 创建输出目录并打开元数据文件。
+   */
   void PrepareOutput()
   {
     session_name_ = cfg_.session_name.empty()
@@ -561,6 +700,9 @@ class VisionCapture : public LibXR::Application
                 session_name_.c_str(), output_dir_.string().c_str());
   }
 
+  /**
+   * @brief 将当前 CameraInfoV 写入采集目录，方便复盘配置来源。
+   */
   void WriteCameraInfoSnapshot()
   {
     std::ofstream out(output_dir_ / "camera_info.txt", std::ios::out);
@@ -583,6 +725,9 @@ class VisionCapture : public LibXR::Application
     out << "\n";
   }
 
+  /**
+   * @brief 按配置启动相机内参标定流程。
+   */
   void StartCameraCalibrationIfNeeded()
   {
     const bool calibration_mode = cfg_.mode == "calibrate_camera";
@@ -607,6 +752,9 @@ class VisionCapture : public LibXR::Application
                 static_cast<unsigned>(cfg_.camera_calibration.auto_save_views));
   }
 
+  /**
+   * @brief 检查当前帧是否满足记录帧率限制。
+   */
   bool AcceptByRate(uint64_t timestamp_us)
   {
     if (cfg_.record.max_fps <= 0.0)
@@ -624,6 +772,9 @@ class VisionCapture : public LibXR::Application
     return true;
   }
 
+  /**
+   * @brief 处理一帧同步图像和 IMU。
+   */
   void ProcessFrame(const SyncedFrame& frame)
   {
     const ImageFrame* image_frame = frame.GetImageFrame();
@@ -689,11 +840,17 @@ class VisionCapture : public LibXR::Application
     frames_saved_.fetch_add(1);
   }
 
+  /**
+   * @brief 当前模式是否只保存通过判稳的标定样本。
+   */
   bool IsCalibrationDatasetMode() const
   {
     return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye";
   }
 
+  /**
+   * @brief 将当前帧交给相机内参标定器。
+   */
   void ProcessCameraCalibration(const cv::Mat& image, uint64_t image_ts)
   {
     const bool calibration_mode = cfg_.mode == "calibrate_camera";
@@ -710,36 +867,66 @@ class VisionCapture : public LibXR::Application
     }
   }
 
+  /// 标定板检测结果类型。
   using BoardObservation = VisionCaptureCalibrationBoard::Observation;
 
+  /**
+   * @brief 一帧标定采样判定结果。
+   */
   struct SamplingDecision
   {
+    /// 当前帧是否被接受为标定样本。
     bool accepted = false;
+    /// 接受或拒绝原因。
     std::string reason = "not_evaluated";
+    /// true 表示 PnP 求解成功。
     bool pnp_ok = false;
+    /// PnP 重投影 RMS，单位像素。
     double pnp_rms_px = 0.0;
+    /// 判稳窗口内 PnP 平移最大抖动，单位 m。
     double pnp_t_jitter_m = 0.0;
+    /// 判稳窗口内 PnP 旋转最大抖动，单位 deg。
     double pnp_r_jitter_deg = 0.0;
+    /// 判稳窗口内 IMU 姿态最大抖动，单位 deg。
     double imu_r_jitter_deg = 0.0;
+    /// 当前帧陀螺仪模长，单位 deg/s。
     double gyro_norm_dps = 0.0;
+    /// 当前帧加速度模长，单位 m/s^2。
     double acc_norm_mps2 = 0.0;
+    /// 当前帧加速度模长与重力加速度差值，单位 m/s^2。
     double acc_norm_error_mps2 = 0.0;
+    /// 判稳窗口内加速度模长抖动，单位 m/s^2。
     double acc_norm_jitter_mps2 = 0.0;
+    /// 判稳窗口内加速度方向最大抖动，单位 deg。
     double acc_dir_jitter_deg = 0.0;
+    /// solvePnP 得到的 Rodrigues 旋转向量。
     cv::Mat rvec{};
+    /// solvePnP 得到的平移向量。
     cv::Mat tvec{};
   };
 
+  /**
+   * @brief 进入稳定窗口的单帧状态。
+   */
   struct StableSample
   {
+    /// IMU 时间戳，单位 us。
     uint64_t timestamp_us = 0;
+    /// 当前帧标定板到相机的旋转向量。
     cv::Mat rvec{};
+    /// 当前帧标定板到相机的平移向量。
     cv::Mat tvec{};
+    /// 当前帧 IMU 姿态四元数，wxyz 顺序。
     cv::Vec4d quat{1.0, 0.0, 0.0, 0.0};
+    /// 当前帧角速度，单位 rad/s。
     cv::Vec3d gyro{};
+    /// 当前帧线加速度，单位 m/s^2。
     cv::Vec3d acc{};
   };
 
+  /**
+   * @brief 检测当前图像中的标定板。
+   */
   BoardObservation DetectBoard(const cv::Mat& image)
   {
     BoardObservation detection;
@@ -777,6 +964,9 @@ class VisionCapture : public LibXR::Application
     return detection;
   }
 
+  /**
+   * @brief 根据 CameraInfoV 构造 OpenCV 相机内参矩阵。
+   */
   cv::Mat CameraMatrix() const
   {
     return (cv::Mat_<double>(3, 3) << CameraInfoV.camera_matrix[0],
@@ -786,6 +976,9 @@ class VisionCapture : public LibXR::Application
             CameraInfoV.camera_matrix[7], CameraInfoV.camera_matrix[8]);
   }
 
+  /**
+   * @brief 根据 CameraInfoV 构造 OpenCV 畸变系数矩阵。
+   */
   cv::Mat DistortionCoefficients() const
   {
     cv::Mat distortion(1, static_cast<int>(CameraInfoV.distortion_coefficients.size()),
@@ -797,6 +990,9 @@ class VisionCapture : public LibXR::Application
     return distortion;
   }
 
+  /**
+   * @brief 对当前标定板观测执行 PnP 并写入采样判定。
+   */
   bool SolveMarkerPnp(const BoardObservation& detection,
                       SamplingDecision& decision) const
   {
@@ -834,6 +1030,9 @@ class VisionCapture : public LibXR::Application
     return true;
   }
 
+  /**
+   * @brief 对一帧图像和 IMU 执行判稳采样。
+   */
   SamplingDecision EvaluateCalibrationSampling(const BoardObservation& detection,
                                                const ImuStamped& imu,
                                                uint64_t dt_us)
@@ -982,6 +1181,9 @@ class VisionCapture : public LibXR::Application
     return decision;
   }
 
+  /**
+   * @brief 计算当前稳定窗口的 PnP、IMU 和加速度抖动。
+   */
   void ComputeWindowStabilityLocked(const StableSample& reference,
                                     SamplingDecision& decision) const
   {
@@ -1039,6 +1241,9 @@ class VisionCapture : public LibXR::Application
     decision.acc_dir_jitter_deg = acc_dir_max;
   }
 
+  /**
+   * @brief 判断样本是否与已经接受的样本过近。
+   */
   bool IsDuplicateCalibrationSampleLocked(const StableSample& sample) const
   {
     for (const StableSample& accepted : accepted_calibration_samples_)
@@ -1056,6 +1261,9 @@ class VisionCapture : public LibXR::Application
     return false;
   }
 
+  /**
+   * @brief 更新最近一次采样状态，供 monitor/status 输出。
+   */
   void SetLastSamplingStatus(const SamplingDecision& decision)
   {
     std::lock_guard<std::mutex> lock(status_mutex_);
@@ -1065,6 +1273,9 @@ class VisionCapture : public LibXR::Application
     last_acc_norm_mps2_ = decision.acc_norm_mps2;
   }
 
+  /**
+   * @brief 提交预览图并绘制标定板角点。
+   */
   void SubmitPreview(const cv::Mat& image, const BoardObservation& detection)
   {
     if (!preview_.Running())
@@ -1089,6 +1300,9 @@ class VisionCapture : public LibXR::Application
                     });
   }
 
+  /**
+   * @brief 按帧号保存图像并返回文件路径。
+   */
   std::string SaveImage(const cv::Mat& image, uint64_t frame_id)
   {
     if (!cfg_.record.save_images)
@@ -1103,6 +1317,9 @@ class VisionCapture : public LibXR::Application
     return path.string();
   }
 
+  /**
+   * @brief 将 marker id 列表格式化为 CSV 单元格。
+   */
   static std::string JoinIds(const std::vector<int>& ids)
   {
     std::ostringstream out;
@@ -1117,6 +1334,9 @@ class VisionCapture : public LibXR::Application
     return out.str();
   }
 
+  /**
+   * @brief 写入一行同步帧和采样状态元数据。
+   */
   void WriteMetadata(uint64_t frame_id, uint64_t image_ts, uint64_t imu_ts,
                      uint64_t dt_us, const ImuStamped& imu,
                      const std::string& image_path, const BoardObservation& detection,
@@ -1151,42 +1371,75 @@ class VisionCapture : public LibXR::Application
   }
 
  private:
+  /// 模块运行配置。
   Config cfg_{};
+  /// 同步帧来源。
   Sync& sync_;
+  /// 可选预览输出。
   VisionPreview preview_{};
+  /// 同步帧消费线程。
   LibXR::Thread worker_thread_{};
+  /// 标准输入命令线程。
   LibXR::Thread control_thread_{};
 
+  /// OpenCV ArUco 字典。
   cv::aruco::Dictionary dictionary_{};
+  /// OpenCV ArUco 检测参数。
   cv::aruco::DetectorParameters detector_params_{};
+  /// 相机内参标定流程对象。
   VisionCaptureCameraCalibration<CameraInfoV> camera_calibration_{};
 
+  /// 标准重力加速度，单位 m/s^2。
   static constexpr double kGravityMps2 = 9.80665;
+  /// 标定采样是否正在运行。
   std::atomic<bool> sampling_running_{true};
+  /// 是否强制接受下一帧有效 PnP 样本。
   std::atomic<bool> force_snapshot_{false};
+  /// 保护稳定窗口和已接受样本。
   mutable std::mutex sampling_mutex_{};
+  /// 最近若干帧稳定性计算窗口。
   std::deque<StableSample> stability_window_{};
+  /// 已接受的标定采样结果。
   std::vector<StableSample> accepted_calibration_samples_{};
+  /// 最近一次接受的样本。
   StableSample last_accepted_sample_{};
+  /// 保护最近一次采样状态文本。
   mutable std::mutex status_mutex_{};
+  /// 最近一次接受或拒绝原因。
   std::string last_reject_reason_{"init"};
+  /// 最近一次 PnP RMS，单位像素。
   double last_pnp_rms_px_{0.0};
+  /// 最近一次陀螺仪模长，单位 deg/s。
   double last_gyro_norm_dps_{0.0};
+  /// 最近一次加速度模长，单位 m/s^2。
   double last_acc_norm_mps2_{0.0};
 
+  /// 当前采集会话名。
   std::string session_name_{};
+  /// 当前采集输出目录。
   std::filesystem::path output_dir_{};
+  /// 当前图像输出目录。
   std::filesystem::path frames_dir_{};
+  /// 同步帧元数据 CSV。
   std::ofstream metadata_csv_{};
 
+  /// 已保存帧总数。
   uint64_t total_saved_frames_{0};
+  /// 最近一次保存图像的时间戳，单位 us。
   uint64_t last_saved_timestamp_us_{0};
+  /// 是否已经打印过不支持图像编码错误。
   bool unsupported_encoding_logged_{false};
 
+  /// monitor 周期内看到的同步帧数。
   std::atomic<uint64_t> frames_seen_{0};
+  /// monitor 周期内保存的同步帧数。
   std::atomic<uint64_t> frames_saved_{0};
+  /// monitor 周期内检测到标定板的帧数。
   std::atomic<uint64_t> boards_detected_{0};
+  /// monitor 周期内 PnP 成功次数。
   std::atomic<uint64_t> sampling_pnp_ok_{0};
+  /// monitor 周期内接受的标定样本数。
   std::atomic<uint64_t> sampling_accepted_{0};
+  /// monitor 周期内拒绝的标定样本数。
   std::atomic<uint64_t> sampling_rejected_{0};
 };
