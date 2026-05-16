@@ -38,6 +38,23 @@ constructor_args:
       cols: 8
       rows: 6
       auto_save_views: 120
+    calibration_sampling:
+      enabled: true
+      auto_start: true
+      window_size: 8
+      min_accept_interval_us: 500000
+      max_pnp_reprojection_rms_px: 2.0
+      max_pnp_translation_jitter_m: 0.005
+      max_pnp_rotation_jitter_deg: 1.0
+      max_imu_rotation_jitter_deg: 0.8
+      max_gyro_norm_dps: 2.0
+      max_acc_norm_error_mps2: 1.5
+      max_acc_norm_jitter_mps2: 0.5
+      max_acc_direction_jitter_deg: 2.0
+      min_sample_translation_delta_m: 0.03
+      min_sample_rotation_delta_deg: 5.0
+    control:
+      stdin_enabled: false
     filter:
       require_synced_imu: true
       max_image_imu_dt_us: 2000
@@ -64,22 +81,28 @@ depends:
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <opencv2/aruco.hpp>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "CameraFrameSync.hpp"
 #include "VisionPreview.hpp"
+#include "VisionCaptureCalibrationBoard.hpp"
 #include "VisionCaptureCameraCalibration.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
@@ -88,6 +111,7 @@ depends:
 namespace VisionCaptureDetail
 {
 inline constexpr size_t kWorkerStackSize = 8192;
+inline constexpr size_t kControlStackSize = 4096;
 inline constexpr uint32_t kSyncWaitTimeoutMs = 1000;
 
 inline std::string ToString(std::string_view value)
@@ -171,6 +195,56 @@ inline cv::Mat MakeBgrForPreview(const cv::Mat& image)
   }
   return bgr;
 }
+
+inline double RadToDeg(double rad) { return rad * 180.0 / CV_PI; }
+
+inline double Norm3(const std::array<float, 3>& value)
+{
+  const double x = value[0];
+  const double y = value[1];
+  const double z = value[2];
+  return std::sqrt(x * x + y * y + z * z);
+}
+
+inline cv::Vec3d ToVec3d(const std::array<float, 3>& value)
+{
+  return {static_cast<double>(value[0]), static_cast<double>(value[1]),
+          static_cast<double>(value[2])};
+}
+
+inline cv::Vec4d NormalizeQuatWxyz(const std::array<float, 4>& q)
+{
+  const double w = q[0];
+  const double x = q[1];
+  const double y = q[2];
+  const double z = q[3];
+  const double norm = std::sqrt(w * w + x * x + y * y + z * z);
+  if (norm <= 1e-9)
+  {
+    return {1.0, 0.0, 0.0, 0.0};
+  }
+  return {w / norm, x / norm, y / norm, z / norm};
+}
+
+inline double QuatAngularDistanceDeg(const cv::Vec4d& lhs, const cv::Vec4d& rhs)
+{
+  const double dot = std::fabs(lhs[0] * rhs[0] + lhs[1] * rhs[1] +
+                              lhs[2] * rhs[2] + lhs[3] * rhs[3]);
+  return RadToDeg(2.0 * std::acos(VisionCaptureCalibrationBoard::ClampUnit(dot)));
+}
+
+inline double RotationDistanceDeg(const cv::Mat& lhs_rvec,
+                                  const cv::Mat& rhs_rvec)
+{
+  cv::Mat lhs;
+  cv::Mat rhs;
+  cv::Rodrigues(lhs_rvec, lhs);
+  cv::Rodrigues(rhs_rvec, rhs);
+  const cv::Mat delta = lhs * rhs.t();
+  const double trace = delta.at<double>(0, 0) + delta.at<double>(1, 1) +
+                       delta.at<double>(2, 2);
+  return RadToDeg(std::acos(VisionCaptureCalibrationBoard::ClampUnit((trace - 1.0) * 0.5)));
+}
 }  // namespace VisionCaptureDetail
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -216,6 +290,29 @@ class VisionCapture : public LibXR::Application
     uint32_t auto_save_views = 120;
   };
 
+  struct CalibrationSamplingParams
+  {
+    bool enabled = true;
+    bool auto_start = true;
+    uint32_t window_size = 8;
+    uint64_t min_accept_interval_us = 500000;
+    double max_pnp_reprojection_rms_px = 2.0;
+    double max_pnp_translation_jitter_m = 0.005;
+    double max_pnp_rotation_jitter_deg = 1.0;
+    double max_imu_rotation_jitter_deg = 0.8;
+    double max_gyro_norm_dps = 2.0;
+    double max_acc_norm_error_mps2 = 1.5;
+    double max_acc_norm_jitter_mps2 = 0.5;
+    double max_acc_direction_jitter_deg = 2.0;
+    double min_sample_translation_delta_m = 0.03;
+    double min_sample_rotation_delta_deg = 5.0;
+  };
+
+  struct ControlParams
+  {
+    bool stdin_enabled = false;
+  };
+
   struct Config
   {
     std::string_view mode = "record";
@@ -225,6 +322,8 @@ class VisionCapture : public LibXR::Application
     VisionPreview::RuntimeParam preview{};
     BoardParams board{};
     CameraCalibrationParams camera_calibration{};
+    CalibrationSamplingParams calibration_sampling{};
+    ControlParams control{};
     FilterParams filter{};
   };
 
@@ -237,11 +336,19 @@ class VisionCapture : public LibXR::Application
   {
     detector_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     preview_.Start(cfg_.preview);
+    sampling_running_.store(cfg_.calibration_sampling.auto_start,
+                            std::memory_order_release);
     PrepareOutput();
     StartCameraCalibrationIfNeeded();
     worker_thread_.Create(this, WorkerThreadFun, "VisionCapture",
                           VisionCaptureDetail::kWorkerStackSize,
                           LibXR::Thread::Priority::MEDIUM);
+    if (cfg_.control.stdin_enabled)
+    {
+      control_thread_.Create(this, ControlThreadFun, "VisionCaptureCtl",
+                             VisionCaptureDetail::kControlStackSize,
+                             LibXR::Thread::Priority::LOW);
+    }
     app.Register(*this);
   }
 
@@ -250,10 +357,18 @@ class VisionCapture : public LibXR::Application
     const uint64_t frames = frames_seen_.exchange(0);
     const uint64_t saved = frames_saved_.exchange(0);
     const uint64_t boards = boards_detected_.exchange(0);
-    XR_LOG_INFO("VisionCapture monitor: frames=%llu saved=%llu boards=%llu",
+    const uint64_t pnp_ok = sampling_pnp_ok_.exchange(0);
+    const uint64_t accepted = sampling_accepted_.exchange(0);
+    const uint64_t rejected = sampling_rejected_.exchange(0);
+    const std::string status = BuildStatusLine();
+    XR_LOG_INFO("VisionCapture monitor: frames=%llu saved=%llu boards=%llu "
+                "pnp_ok=%llu accepted=%llu rejected=%llu %s",
                 static_cast<unsigned long long>(frames),
                 static_cast<unsigned long long>(saved),
-                static_cast<unsigned long long>(boards));
+                static_cast<unsigned long long>(boards),
+                static_cast<unsigned long long>(pnp_ok),
+                static_cast<unsigned long long>(accepted),
+                static_cast<unsigned long long>(rejected), status.c_str());
   }
 
  private:
@@ -289,6 +404,131 @@ class VisionCapture : public LibXR::Application
     }
   }
 
+  static void ControlThreadFun(VisionCapture* self)
+  {
+    XR_LOG_INFO("VisionCapture stdin control ready: help/status/start/pause/reset/solve/snapshot");
+    std::string line;
+    while (std::getline(std::cin, line))
+    {
+      self->HandleControlCommand(line);
+    }
+    XR_LOG_INFO("VisionCapture stdin control stopped: stdin closed");
+  }
+
+  void HandleControlCommand(std::string_view command)
+  {
+    while (!command.empty() &&
+           (command.front() == ' ' || command.front() == '\t' ||
+            command.front() == '\r' || command.front() == '\n'))
+    {
+      command.remove_prefix(1);
+    }
+    while (!command.empty() &&
+           (command.back() == ' ' || command.back() == '\t' ||
+            command.back() == '\r' || command.back() == '\n'))
+    {
+      command.remove_suffix(1);
+    }
+    if (command == "start")
+    {
+      sampling_running_.store(true, std::memory_order_release);
+      XR_LOG_PASS("VisionCapture control: sampling started");
+    }
+    else if (command == "pause" || command == "stop")
+    {
+      sampling_running_.store(false, std::memory_order_release);
+      XR_LOG_INFO("VisionCapture control: sampling paused");
+    }
+    else if (command == "reset")
+    {
+      ResetCalibrationSampling();
+      XR_LOG_PASS("VisionCapture control: sampling reset");
+    }
+    else if (command == "status")
+    {
+      const std::string status = BuildStatusLine();
+      XR_LOG_INFO("VisionCapture status: %s", status.c_str());
+    }
+    else if (command == "solve")
+    {
+      SolveCurrentCalibration();
+    }
+    else if (command == "snapshot")
+    {
+      force_snapshot_.store(true, std::memory_order_release);
+      XR_LOG_INFO("VisionCapture control: snapshot requested");
+    }
+    else if (command == "help")
+    {
+      XR_LOG_INFO("VisionCapture commands: start pause reset solve status snapshot help");
+    }
+    else if (!command.empty())
+    {
+      const std::string text(command);
+      XR_LOG_WARN("VisionCapture control: unknown command '%s'", text.c_str());
+    }
+  }
+
+  void ResetCalibrationSampling()
+  {
+    std::lock_guard<std::mutex> lock(sampling_mutex_);
+    stability_window_.clear();
+    accepted_calibration_samples_.clear();
+    last_accepted_sample_ = StableSample{};
+    {
+      std::lock_guard<std::mutex> status_lock(status_mutex_);
+      last_reject_reason_ = "reset";
+      last_pnp_rms_px_ = 0.0;
+      last_gyro_norm_dps_ = 0.0;
+      last_acc_norm_mps2_ = 0.0;
+    }
+  }
+
+  void SolveCurrentCalibration()
+  {
+    const bool camera_mode = cfg_.mode == "calibrate_camera" ||
+                             cfg_.camera_calibration.enabled;
+    if (camera_mode)
+    {
+      if (camera_calibration_.SaveAndStop())
+      {
+        XR_LOG_PASS("VisionCapture control: camera calibration solved");
+      }
+      else
+      {
+        XR_LOG_WARN("VisionCapture control: camera calibration solve failed");
+      }
+      return;
+    }
+
+    std::size_t samples = 0;
+    {
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      samples = accepted_calibration_samples_.size();
+    }
+    XR_LOG_WARN("VisionCapture control: handeye solver is not implemented yet, accepted_samples=%u",
+                static_cast<unsigned>(samples));
+  }
+
+  std::string BuildStatusLine() const
+  {
+    std::size_t samples = 0;
+    {
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      samples = accepted_calibration_samples_.size();
+    }
+    std::lock_guard<std::mutex> status_lock(status_mutex_);
+    std::ostringstream out;
+    out << "mode=" << cfg_.mode
+        << " sampling=" << (sampling_running_.load(std::memory_order_acquire) ? 1 : 0)
+        << " accepted_total=" << samples
+        << " last_reason=" << last_reject_reason_
+        << " last_pnp_rms_px=" << last_pnp_rms_px_
+        << " last_gyro_norm_dps=" << last_gyro_norm_dps_
+        << " last_acc_norm_mps2=" << last_acc_norm_mps2_;
+    return out.str();
+  }
+
   void PrepareOutput()
   {
     session_name_ = cfg_.session_name.empty()
@@ -308,7 +548,11 @@ class VisionCapture : public LibXR::Application
         metadata_csv_
             << "frame_id,image_timestamp_us,imu_timestamp_us,dt_us,"
                "qw,qx,qy,qz,gx,gy,gz,ax,ay,az,image_path,"
-               "board_detected,marker_count,marker_ids\n";
+               "board_detected,marker_count,marker_ids,"
+               "accepted,reject_reason,pnp_ok,pnp_rms_px,"
+               "pnp_t_jitter_m,pnp_r_jitter_deg,imu_r_jitter_deg,"
+               "gyro_norm_dps,acc_norm_mps2,acc_norm_error_mps2,"
+               "acc_norm_jitter_mps2,acc_dir_jitter_deg\n";
       }
       WriteCameraInfoSnapshot();
     }
@@ -410,15 +654,25 @@ class VisionCapture : public LibXR::Application
       return;
     }
 
-    Detection detection = DetectBoard(image);
-    if (detection.detected)
+    BoardObservation detection = DetectBoard(image);
+    if (detection.observed)
     {
       boards_detected_.fetch_add(1);
     }
+    SamplingDecision sampling = EvaluateCalibrationSampling(detection, frame.imu, dt_us);
     SubmitPreview(image, detection);
     ProcessCameraCalibration(image, image_ts);
 
-    if (!cfg_.record.enabled || !AcceptByRate(image_ts))
+    if (!cfg_.record.enabled)
+    {
+      return;
+    }
+    const bool calibration_recording = IsCalibrationDatasetMode();
+    if (calibration_recording && !sampling.accepted)
+    {
+      return;
+    }
+    if (!calibration_recording && !AcceptByRate(image_ts))
     {
       return;
     }
@@ -431,8 +685,13 @@ class VisionCapture : public LibXR::Application
     last_saved_timestamp_us_ = image_ts;
     const std::string image_path = SaveImage(image, total_saved_frames_);
     WriteMetadata(total_saved_frames_, image_ts, imu_ts, dt_us, frame.imu,
-                  image_path, detection);
+                  image_path, detection, sampling);
     frames_saved_.fetch_add(1);
+  }
+
+  bool IsCalibrationDatasetMode() const
+  {
+    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye";
   }
 
   void ProcessCameraCalibration(const cv::Mat& image, uint64_t image_ts)
@@ -451,33 +710,362 @@ class VisionCapture : public LibXR::Application
     }
   }
 
-  struct Detection
+  using BoardObservation = VisionCaptureCalibrationBoard::Observation;
+
+  struct SamplingDecision
   {
-    bool detected = false;
-    std::vector<int> ids;
-    std::vector<std::vector<cv::Point2f>> corners;
+    bool accepted = false;
+    std::string reason = "not_evaluated";
+    bool pnp_ok = false;
+    double pnp_rms_px = 0.0;
+    double pnp_t_jitter_m = 0.0;
+    double pnp_r_jitter_deg = 0.0;
+    double imu_r_jitter_deg = 0.0;
+    double gyro_norm_dps = 0.0;
+    double acc_norm_mps2 = 0.0;
+    double acc_norm_error_mps2 = 0.0;
+    double acc_norm_jitter_mps2 = 0.0;
+    double acc_dir_jitter_deg = 0.0;
+    cv::Mat rvec{};
+    cv::Mat tvec{};
   };
 
-  Detection DetectBoard(const cv::Mat& image)
+  struct StableSample
   {
-    Detection detection;
+    uint64_t timestamp_us = 0;
+    cv::Mat rvec{};
+    cv::Mat tvec{};
+    cv::Vec4d quat{1.0, 0.0, 0.0, 0.0};
+    cv::Vec3d gyro{};
+    cv::Vec3d acc{};
+  };
+
+  BoardObservation DetectBoard(const cv::Mat& image)
+  {
+    BoardObservation detection;
     if (cfg_.board.type != "aruco")
     {
       return detection;
     }
 
+    cv::Mat ids;
 #if CV_VERSION_MAJOR >= 4 && CV_VERSION_MINOR >= 7
     cv::aruco::ArucoDetector detector(dictionary_, detector_params_);
-    detector.detectMarkers(image, detection.corners, detection.ids);
+    detector.detectMarkers(image, detection.marker_corners, ids);
 #else
-    cv::aruco::detectMarkers(image, dictionary_, detection.corners, detection.ids,
+    cv::aruco::detectMarkers(image, dictionary_, detection.marker_corners, ids,
                              detector_params_);
 #endif
-    detection.detected = !detection.ids.empty();
+    if (!ids.empty())
+    {
+      detection.marker_ids = ids.clone();
+      for (int i = 0; i < ids.rows; ++i)
+      {
+        detection.marker_ids_vec.push_back(ids.at<int>(i, 0));
+      }
+      const auto board = VisionCaptureCalibrationBoard::MakeSingleArucoBoard(
+          cfg_.board.marker_length_m);
+      VisionCaptureCalibrationBoard::CollectBoardPoints(detection.marker_corners,
+                                             detection.marker_ids, board,
+                                             detection);
+      detection.homography_rms =
+          VisionCaptureCalibrationBoard::HomographyRms(detection.object_points,
+                                            detection.image_points);
+      VisionCaptureCalibrationBoard::FillQuality(image, CameraInfoV.width, CameraInfoV.height,
+                                      detection);
+    }
     return detection;
   }
 
-  void SubmitPreview(const cv::Mat& image, const Detection& detection)
+  cv::Mat CameraMatrix() const
+  {
+    return (cv::Mat_<double>(3, 3) << CameraInfoV.camera_matrix[0],
+            CameraInfoV.camera_matrix[1], CameraInfoV.camera_matrix[2],
+            CameraInfoV.camera_matrix[3], CameraInfoV.camera_matrix[4],
+            CameraInfoV.camera_matrix[5], CameraInfoV.camera_matrix[6],
+            CameraInfoV.camera_matrix[7], CameraInfoV.camera_matrix[8]);
+  }
+
+  cv::Mat DistortionCoefficients() const
+  {
+    cv::Mat distortion(1, static_cast<int>(CameraInfoV.distortion_coefficients.size()),
+                       CV_64F);
+    for (int i = 0; i < distortion.cols; ++i)
+    {
+      distortion.at<double>(0, i) = CameraInfoV.distortion_coefficients[i];
+    }
+    return distortion;
+  }
+
+  bool SolveMarkerPnp(const BoardObservation& detection,
+                      SamplingDecision& decision) const
+  {
+    if (!detection.observed)
+    {
+      decision.reason = "board_not_detected";
+      return false;
+    }
+    try
+    {
+      const auto pose =
+          VisionCaptureCalibrationBoard::EstimatePose(detection, CameraMatrix(),
+                                       DistortionCoefficients(),
+                                       cv::SOLVEPNP_IPPE_SQUARE);
+      if (!pose.ok)
+      {
+        decision.reason = "pnp_failed";
+        return false;
+      }
+      decision.pnp_rms_px = pose.reprojection_rms_px;
+      decision.rvec = pose.rvec;
+      decision.tvec = pose.tvec;
+    }
+    catch (const cv::Exception& e)
+    {
+      decision.reason = "pnp_exception";
+      return false;
+    }
+    if (decision.pnp_rms_px > cfg_.calibration_sampling.max_pnp_reprojection_rms_px)
+    {
+      decision.reason = "pnp_rms";
+      return false;
+    }
+    decision.pnp_ok = true;
+    return true;
+  }
+
+  SamplingDecision EvaluateCalibrationSampling(const BoardObservation& detection,
+                                               const ImuStamped& imu,
+                                               uint64_t dt_us)
+  {
+    SamplingDecision decision;
+    if (!IsCalibrationDatasetMode() || !cfg_.calibration_sampling.enabled)
+    {
+      decision.accepted = true;
+      decision.reason = "record_all";
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (!sampling_running_.load(std::memory_order_acquire))
+    {
+      decision.reason = "sampling_paused";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (dt_us > cfg_.filter.max_image_imu_dt_us)
+    {
+      decision.reason = "sync_dt";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (!SolveMarkerPnp(detection, decision))
+    {
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    sampling_pnp_ok_.fetch_add(1);
+
+    StableSample sample;
+    sample.timestamp_us = static_cast<uint64_t>(imu.timestamp_us);
+    sample.rvec = decision.rvec.clone();
+    sample.tvec = decision.tvec.clone();
+    sample.quat = VisionCaptureDetail::NormalizeQuatWxyz(imu.rotation_wxyz);
+    sample.gyro = VisionCaptureDetail::ToVec3d(imu.angular_velocity_xyz);
+    sample.acc = VisionCaptureDetail::ToVec3d(imu.linear_acceleration_xyz);
+    decision.gyro_norm_dps = VisionCaptureDetail::RadToDeg(cv::norm(sample.gyro));
+    decision.acc_norm_mps2 = cv::norm(sample.acc);
+    decision.acc_norm_error_mps2 =
+        std::fabs(decision.acc_norm_mps2 - kGravityMps2);
+
+    const bool force_snapshot = force_snapshot_.exchange(false, std::memory_order_acq_rel);
+    {
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      stability_window_.push_back(sample);
+      while (stability_window_.size() > cfg_.calibration_sampling.window_size)
+      {
+        stability_window_.pop_front();
+      }
+      if (stability_window_.size() < cfg_.calibration_sampling.window_size)
+      {
+        decision.reason = "stability_window";
+        sampling_rejected_.fetch_add(1);
+        SetLastSamplingStatus(decision);
+        return decision;
+      }
+
+      ComputeWindowStabilityLocked(sample, decision);
+    }
+    if (decision.pnp_t_jitter_m >
+        cfg_.calibration_sampling.max_pnp_translation_jitter_m)
+    {
+      decision.reason = "pnp_translation_unstable";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (decision.pnp_r_jitter_deg >
+        cfg_.calibration_sampling.max_pnp_rotation_jitter_deg)
+    {
+      decision.reason = "pnp_rotation_unstable";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (decision.imu_r_jitter_deg >
+        cfg_.calibration_sampling.max_imu_rotation_jitter_deg)
+    {
+      decision.reason = "imu_rotation_unstable";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (decision.gyro_norm_dps > cfg_.calibration_sampling.max_gyro_norm_dps)
+    {
+      decision.reason = "gyro_moving";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (decision.acc_norm_error_mps2 >
+        cfg_.calibration_sampling.max_acc_norm_error_mps2)
+    {
+      decision.reason = "acc_not_gravity";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (decision.acc_norm_jitter_mps2 >
+        cfg_.calibration_sampling.max_acc_norm_jitter_mps2)
+    {
+      decision.reason = "acc_vibration";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (decision.acc_dir_jitter_deg >
+        cfg_.calibration_sampling.max_acc_direction_jitter_deg)
+    {
+      decision.reason = "acc_direction_unstable";
+      sampling_rejected_.fetch_add(1);
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    {
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      if (!force_snapshot && last_accepted_sample_.timestamp_us != 0 &&
+          sample.timestamp_us > last_accepted_sample_.timestamp_us &&
+          sample.timestamp_us - last_accepted_sample_.timestamp_us <
+              cfg_.calibration_sampling.min_accept_interval_us)
+      {
+        decision.reason = "accept_interval";
+        sampling_rejected_.fetch_add(1);
+        SetLastSamplingStatus(decision);
+        return decision;
+      }
+      if (!force_snapshot && IsDuplicateCalibrationSampleLocked(sample))
+      {
+        decision.reason = "duplicate_pose";
+        sampling_rejected_.fetch_add(1);
+        SetLastSamplingStatus(decision);
+        return decision;
+      }
+      accepted_calibration_samples_.push_back(sample);
+      last_accepted_sample_ = sample;
+    }
+    decision.accepted = true;
+    decision.reason = force_snapshot ? "snapshot" : "accepted";
+    sampling_accepted_.fetch_add(1);
+    SetLastSamplingStatus(decision);
+    return decision;
+  }
+
+  void ComputeWindowStabilityLocked(const StableSample& reference,
+                                    SamplingDecision& decision) const
+  {
+    double translation_max = 0.0;
+    double rotation_max = 0.0;
+    double imu_rotation_max = 0.0;
+    double acc_norm_sum = 0.0;
+    double acc_norm_sum2 = 0.0;
+    cv::Vec3d acc_dir_sum{};
+    for (const StableSample& sample : stability_window_)
+    {
+      translation_max =
+          std::max(translation_max, cv::norm(sample.tvec - reference.tvec));
+      rotation_max = std::max(rotation_max,
+                              VisionCaptureDetail::RotationDistanceDeg(
+                                  sample.rvec, reference.rvec));
+      imu_rotation_max =
+          std::max(imu_rotation_max, VisionCaptureDetail::QuatAngularDistanceDeg(
+                                         sample.quat, reference.quat));
+      const double acc_norm = cv::norm(sample.acc);
+      acc_norm_sum += acc_norm;
+      acc_norm_sum2 += acc_norm * acc_norm;
+      if (acc_norm > 1e-6)
+      {
+        acc_dir_sum += sample.acc * (1.0 / acc_norm);
+      }
+    }
+    const double count = static_cast<double>(stability_window_.size());
+    const double acc_mean = acc_norm_sum / count;
+    const double acc_var = std::max(0.0, acc_norm_sum2 / count - acc_mean * acc_mean);
+    cv::Vec3d acc_dir_mean = acc_dir_sum * (1.0 / count);
+    const double acc_dir_mean_norm = cv::norm(acc_dir_mean);
+    if (acc_dir_mean_norm > 1e-6)
+    {
+      acc_dir_mean *= 1.0 / acc_dir_mean_norm;
+    }
+    double acc_dir_max = 0.0;
+    for (const StableSample& sample : stability_window_)
+    {
+      const double acc_norm = cv::norm(sample.acc);
+      if (acc_norm <= 1e-6 || acc_dir_mean_norm <= 1e-6)
+      {
+        continue;
+      }
+      const cv::Vec3d dir = sample.acc * (1.0 / acc_norm);
+      acc_dir_max = std::max(
+          acc_dir_max,
+          VisionCaptureDetail::RadToDeg(std::acos(
+              VisionCaptureCalibrationBoard::ClampUnit(dir.dot(acc_dir_mean)))));
+    }
+    decision.pnp_t_jitter_m = translation_max;
+    decision.pnp_r_jitter_deg = rotation_max;
+    decision.imu_r_jitter_deg = imu_rotation_max;
+    decision.acc_norm_jitter_mps2 = std::sqrt(acc_var);
+    decision.acc_dir_jitter_deg = acc_dir_max;
+  }
+
+  bool IsDuplicateCalibrationSampleLocked(const StableSample& sample) const
+  {
+    for (const StableSample& accepted : accepted_calibration_samples_)
+    {
+      const double translation_delta = cv::norm(sample.tvec - accepted.tvec);
+      const double rotation_delta =
+          VisionCaptureDetail::RotationDistanceDeg(sample.rvec, accepted.rvec);
+      if (translation_delta <
+              cfg_.calibration_sampling.min_sample_translation_delta_m &&
+          rotation_delta < cfg_.calibration_sampling.min_sample_rotation_delta_deg)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void SetLastSamplingStatus(const SamplingDecision& decision)
+  {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    last_reject_reason_ = decision.reason;
+    last_pnp_rms_px_ = decision.pnp_rms_px;
+    last_gyro_norm_dps_ = decision.gyro_norm_dps;
+    last_acc_norm_mps2_ = decision.acc_norm_mps2;
+  }
+
+  void SubmitPreview(const cv::Mat& image, const BoardObservation& detection)
   {
     if (!preview_.Running())
     {
@@ -492,10 +1080,11 @@ class VisionCapture : public LibXR::Application
     preview_.Submit(preview_image,
                     [detection](cv::Mat& frame)
                     {
-                      if (detection.detected)
+                      if (detection.observed)
                       {
-                        cv::aruco::drawDetectedMarkers(frame, detection.corners,
-                                                       detection.ids);
+                        cv::aruco::drawDetectedMarkers(frame,
+                                                       detection.marker_corners,
+                                                       detection.marker_ids);
                       }
                     });
   }
@@ -530,7 +1119,8 @@ class VisionCapture : public LibXR::Application
 
   void WriteMetadata(uint64_t frame_id, uint64_t image_ts, uint64_t imu_ts,
                      uint64_t dt_us, const ImuStamped& imu,
-                     const std::string& image_path, const Detection& detection)
+                     const std::string& image_path, const BoardObservation& detection,
+                     const SamplingDecision& sampling)
   {
     if (!metadata_csv_.is_open())
     {
@@ -545,8 +1135,18 @@ class VisionCapture : public LibXR::Application
                   << imu.linear_acceleration_xyz[0] << ","
                   << imu.linear_acceleration_xyz[1] << ","
                   << imu.linear_acceleration_xyz[2] << "," << image_path << ","
-                  << (detection.detected ? 1 : 0) << ","
-                  << detection.ids.size() << "," << JoinIds(detection.ids) << "\n";
+                  << (detection.observed ? 1 : 0) << ","
+                  << detection.marker_ids_vec.size() << ","
+                  << JoinIds(detection.marker_ids_vec) << ","
+                  << (sampling.accepted ? 1 : 0) << "," << sampling.reason << ","
+                  << (sampling.pnp_ok ? 1 : 0) << "," << sampling.pnp_rms_px
+                  << "," << sampling.pnp_t_jitter_m << ","
+                  << sampling.pnp_r_jitter_deg << ","
+                  << sampling.imu_r_jitter_deg << ","
+                  << sampling.gyro_norm_dps << "," << sampling.acc_norm_mps2
+                  << "," << sampling.acc_norm_error_mps2 << ","
+                  << sampling.acc_norm_jitter_mps2 << ","
+                  << sampling.acc_dir_jitter_deg << "\n";
     metadata_csv_.flush();
   }
 
@@ -555,10 +1155,24 @@ class VisionCapture : public LibXR::Application
   Sync& sync_;
   VisionPreview preview_{};
   LibXR::Thread worker_thread_{};
+  LibXR::Thread control_thread_{};
 
   cv::aruco::Dictionary dictionary_{};
   cv::aruco::DetectorParameters detector_params_{};
   VisionCaptureCameraCalibration<CameraInfoV> camera_calibration_{};
+
+  static constexpr double kGravityMps2 = 9.80665;
+  std::atomic<bool> sampling_running_{true};
+  std::atomic<bool> force_snapshot_{false};
+  mutable std::mutex sampling_mutex_{};
+  std::deque<StableSample> stability_window_{};
+  std::vector<StableSample> accepted_calibration_samples_{};
+  StableSample last_accepted_sample_{};
+  mutable std::mutex status_mutex_{};
+  std::string last_reject_reason_{"init"};
+  double last_pnp_rms_px_{0.0};
+  double last_gyro_norm_dps_{0.0};
+  double last_acc_norm_mps2_{0.0};
 
   std::string session_name_{};
   std::filesystem::path output_dir_{};
@@ -572,4 +1186,7 @@ class VisionCapture : public LibXR::Application
   std::atomic<uint64_t> frames_seen_{0};
   std::atomic<uint64_t> frames_saved_{0};
   std::atomic<uint64_t> boards_detected_{0};
+  std::atomic<uint64_t> sampling_pnp_ok_{0};
+  std::atomic<uint64_t> sampling_accepted_{0};
+  std::atomic<uint64_t> sampling_rejected_{0};
 };

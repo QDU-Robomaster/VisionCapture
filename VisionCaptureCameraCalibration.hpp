@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CameraBaseIntrinsicSanity.hpp"
+#include "VisionCaptureCalibrationBoard.hpp"
 #include "logger.hpp"
 
 #include <opencv2/aruco.hpp>
@@ -199,7 +200,7 @@ class VisionCaptureCameraCalibration
       return true;
     }
 
-    Detection detection;
+    Observation observation;
     // MakeImageView() 只封装外部图像内存，不拥有像素数据，不在锁内跑 OpenCV。
     const cv::Mat image = MakeImageView(data);
     if (image.empty())
@@ -207,15 +208,15 @@ class VisionCaptureCameraCalibration
       LogUnsupportedEncodingOnce();
       return true;
     }
-    if (!DetectUsableView(image, snapshot, detection))
+    if (!BuildUsableObservation(image, snapshot, observation))
     {
       return true;
     }
 
     StoredView stored;
-    if (StoreDetection(snapshot, detection, stored))
+    if (StoreObservation(snapshot, observation, stored))
     {
-      SaveDebugImage(image, detection, stored);
+      SaveDebugImage(image, observation, stored);
     }
     return true;
   }
@@ -345,7 +346,7 @@ class VisionCaptureCameraCalibration
   /// 单个 ArUco marker 在标定板坐标系下的四个三维角点，顺序匹配 OpenCV 检测结果。
   using MarkerCorners = std::array<cv::Point3f, 4>;
   /// marker id 到三维角点的查表；用于把 GShang 生成器布局映射为 OpenCV object points。
-  using BoardMap = std::map<int, MarkerCorners>;
+  using BoardMap = VisionCaptureCalibrationBoard::BoardMap;
 
   /**
    * @brief 已接受并参与后续标定求解的单视角样本。
@@ -399,39 +400,11 @@ class VisionCaptureCameraCalibration
     uint64_t timestamp_us = 0;
   };
 
-  /**
-   * @brief 单帧检测产生的中间结果。
-   *
-   * Detection 包含 OpenCV 原始 marker 结果、转换后的点集，以及用于决定是否入库的质量指标。
-   */
-  struct Detection
-  {
-    /// 当前帧中属于本标定板且角点完整的 marker 数。
-    int used_markers = 0;
-    /// 单应性 RMS，越大说明点集越不符合单平面标定板模型。
-    double homography_rms = 0.0;
-    /// marker 区域清晰度分数。
-    double sharpness_score = 0.0;
-    /// 标定板外接框中心归一化 x 坐标。
-    double center_x_norm = 0.0;
-    /// 标定板外接框中心归一化 y 坐标。
-    double center_y_norm = 0.0;
-    /// 标定板外接框归一化尺度。
-    double scale_norm = 0.0;
-    /// 标定板图像平面内角度。
-    double angle_deg = 0.0;
-    /// 已按 marker id 映射后的三维点。
-    std::vector<cv::Point3f> object_points;
-    /// 已按 marker id 映射后的二维点。
-    std::vector<cv::Point2f> image_points;
-    /// OpenCV detectMarkers 返回的 marker 四角点，保留用于 debug 绘制和清晰度 mask。
-    std::vector<std::vector<cv::Point2f>> marker_corners;
-    /// OpenCV detectMarkers 返回的 marker id 列矩阵。
-    cv::Mat marker_ids;
-  };
+  /// 单帧标定板观测，包含 marker 角点、标定点集和在线质量指标。
+  using Observation = VisionCaptureCalibrationBoard::Observation;
 
   /**
-   * @brief StoreDetection() 接受样本后传给 SaveDebugImage() 的轻量元数据。
+   * @brief StoreObservation() 接受样本后传给 SaveDebugImage() 的轻量元数据。
    *
    * 该结构避免 SaveDebugImage() 重新加锁读取 accepted_views_。
    */
@@ -562,7 +535,7 @@ class VisionCaptureCameraCalibration
     }
 
     ++processed_frames_;
-    // 复制完整检测上下文，后续 DetectUsableView() 可以无锁运行。
+    // 复制完整观测上下文，后续 BuildUsableObservation() 可以无锁运行。
     snapshot.config = config_;
     snapshot.board = board_;
     snapshot.dictionary = dictionary_;
@@ -573,12 +546,13 @@ class VisionCaptureCameraCalibration
   }
 
   /**
-   * @brief 对单帧运行 ArUco 检测，并判断是否达到基础可用条件。
+   * @brief 对单帧运行 ArUco 观测，并判断是否达到基础可用条件。
    *
    * @return true 表示 marker 数、GShang id 映射、平面单应性和质量指标都已准备好。
    */
-  bool DetectUsableView(const cv::Mat& image, const FrameSnapshot& snapshot,
-                        Detection& detection)
+  bool BuildUsableObservation(const cv::Mat& image,
+                              const FrameSnapshot& snapshot,
+                              Observation& observation)
   {
     std::vector<std::vector<cv::Point2f>> rejected;
     try
@@ -586,15 +560,15 @@ class VisionCaptureCameraCalibration
 #if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 7)
       cv::aruco::ArucoDetector detector(snapshot.dictionary,
                                         snapshot.detector_params);
-      detector.detectMarkers(image, detection.marker_corners,
-                             detection.marker_ids, rejected);
+      detector.detectMarkers(image, observation.marker_corners,
+                             observation.marker_ids, rejected);
 #else
       const auto dictionary =
           cv::makePtr<cv::aruco::Dictionary>(snapshot.dictionary);
       const auto detector_params =
           cv::makePtr<cv::aruco::DetectorParameters>(snapshot.detector_params);
-      cv::aruco::detectMarkers(image, dictionary, detection.marker_corners,
-                               detection.marker_ids, detector_params, rejected);
+      cv::aruco::detectMarkers(image, dictionary, observation.marker_corners,
+                               observation.marker_ids, detector_params, rejected);
 #endif
     }
     catch (const cv::Exception& e)
@@ -604,9 +578,9 @@ class VisionCaptureCameraCalibration
     }
 
     // 只收集属于当前 GShang 标定板布局的 marker，画面里的其它 marker 直接忽略。
-    if (!CollectPoints(detection.marker_corners, detection.marker_ids,
-                       snapshot.board, detection.object_points,
-                       detection.image_points, detection.used_markers))
+    if (!VisionCaptureCalibrationBoard::CollectBoardPoints(
+            observation.marker_corners, observation.marker_ids, snapshot.board,
+            observation))
     {
       return false;
     }
@@ -617,16 +591,18 @@ class VisionCaptureCameraCalibration
     }
 
     // 单应性 RMS 是快速几何门槛，能在 calibrateCamera 前拒绝明显错配的角点集。
-    detection.homography_rms =
-        HomographyRms(detection.object_points, detection.image_points);
-    if (detection.used_markers < RequiredMarkerCount(snapshot.config) ||
-        detection.homography_rms > snapshot.config.max_homography_rms)
+    observation.homography_rms =
+        VisionCaptureCalibrationBoard::HomographyRms(observation.object_points,
+                                                     observation.image_points);
+    if (observation.used_markers < RequiredMarkerCount(snapshot.config) ||
+        observation.homography_rms > snapshot.config.max_homography_rms)
     {
       return false;
     }
 
     // 质量指标只对已经通过基础几何门槛的帧计算，减少无效帧的额外开销。
-    FillDetectionQuality(image, detection);
+    VisionCaptureCalibrationBoard::FillQuality(image, CameraInfoV.width,
+                                               CameraInfoV.height, observation);
     return true;
   }
 
@@ -635,8 +611,8 @@ class VisionCaptureCameraCalibration
    *
    * @return true 表示该视角已被接受，调用方应同步保存 debug 图。
    */
-  bool StoreDetection(const FrameSnapshot& snapshot, const Detection& detection,
-                      StoredView& stored)
+  bool StoreObservation(const FrameSnapshot& snapshot,
+                        const Observation& observation, StoredView& stored)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!active_)
@@ -654,54 +630,55 @@ class VisionCaptureCameraCalibration
     }
 
     // 使用“绝对清晰度”和“相对本轮最佳清晰度”两条线处理不同曝光/距离的视频。
-    best_sharpness_score_ = std::max(best_sharpness_score_, detection.sharpness_score);
+    best_sharpness_score_ =
+        std::max(best_sharpness_score_, observation.sharpness_score);
     const double sharpness_threshold =
         std::max(config_.min_sharpness_score,
                  best_sharpness_score_ * config_.min_sharpness_best_ratio);
-    if (detection.sharpness_score < sharpness_threshold)
+    if (observation.sharpness_score < sharpness_threshold)
     {
       ++sharpness_rejected_frames_;
       return false;
     }
 
     // 近重复门槛鼓励覆盖不同中心、距离和旋转，提升内参可观测性。
-    if (IsNearDuplicateLocked(detection))
+    if (IsNearDuplicateLocked(observation))
     {
       ++duplicate_rejected_frames_;
       return false;
     }
 
-    // 入库的 View 与 Detection 分离，保留标定所需点集和质量指标即可。
+    // 入库的 View 与 Observation 分离，保留标定所需点集和质量指标即可。
     View view;
     view.frame_index = snapshot.frame_index;
     view.timestamp_us = snapshot.timestamp_us;
-    view.used_markers = detection.used_markers;
-    view.homography_rms = detection.homography_rms;
-    view.sharpness_score = detection.sharpness_score;
-    view.center_x_norm = detection.center_x_norm;
-    view.center_y_norm = detection.center_y_norm;
-    view.scale_norm = detection.scale_norm;
-    view.angle_deg = detection.angle_deg;
-    view.object_points = detection.object_points;
-    view.image_points = detection.image_points;
+    view.used_markers = observation.used_markers;
+    view.homography_rms = observation.homography_rms;
+    view.sharpness_score = observation.sharpness_score;
+    view.center_x_norm = observation.center_x_norm;
+    view.center_y_norm = observation.center_y_norm;
+    view.scale_norm = observation.scale_norm;
+    view.angle_deg = observation.angle_deg;
+    view.object_points = observation.object_points;
+    view.image_points = observation.image_points;
     accepted_views_.push_back(std::move(view));
     last_accept_timestamp_us_ = snapshot.timestamp_us;
 
     stored.debug_dir = debug_dir_;
     stored.view_number = accepted_views_.size();
     stored.frame_index = snapshot.frame_index;
-    stored.used_markers = detection.used_markers;
-    stored.homography_rms = detection.homography_rms;
-    stored.sharpness_score = detection.sharpness_score;
+    stored.used_markers = observation.used_markers;
+    stored.homography_rms = observation.homography_rms;
+    stored.sharpness_score = observation.sharpness_score;
 
     XR_LOG_PASS("camera calibration: accepted=%u frames=%u processed=%u "
                 "detected=%u markers=%d H-rms=%.3f sharpness=%.1f ts_ms=%u",
                 static_cast<unsigned>(accepted_views_.size()),
                 static_cast<unsigned>(swallowed_frames_),
                 static_cast<unsigned>(processed_frames_),
-                static_cast<unsigned>(detected_frames_), detection.used_markers,
-                static_cast<float>(detection.homography_rms),
-                static_cast<float>(detection.sharpness_score),
+                static_cast<unsigned>(detected_frames_), observation.used_markers,
+                static_cast<float>(observation.homography_rms),
+                static_cast<float>(observation.sharpness_score),
                 static_cast<unsigned>(snapshot.timestamp_us / 1000U));
 
     if (!recommended_views_logged_ &&
@@ -832,189 +809,9 @@ class VisionCaptureCameraCalibration
    */
   static BoardMap MakeGShangMarkerMap(const Config& config)
   {
-    const double cell_mm = config.marker_mm / static_cast<double>(gshang_marker_cells);
-    const double square_mm = cell_mm * static_cast<double>(gshang_square_cells);
-    const double marker_offset_mm = cell_mm;
-
-    BoardMap map;
-    int marker_id = 0;
-    for (int row = 0; row < config.rows; ++row)
-    {
-      for (int col = 0; col < config.cols; ++col)
-      {
-        // GShang ChArUco 只在黑白棋盘的奇偶格中放 marker，id 按扫描顺序递增。
-        if (((row + col) % 2) == 0)
-        {
-          continue;
-        }
-
-        const float x0 = static_cast<float>(col * square_mm + marker_offset_mm);
-        const float y0 = static_cast<float>(row * square_mm + marker_offset_mm);
-        const float x1 = x0 + static_cast<float>(config.marker_mm);
-        const float y1 = y0 + static_cast<float>(config.marker_mm);
-        map[marker_id++] = {cv::Point3f{x0, y0, 0.0F},
-                            cv::Point3f{x1, y0, 0.0F},
-                            cv::Point3f{x1, y1, 0.0F},
-                            cv::Point3f{x0, y1, 0.0F}};
-      }
-    }
-    return map;
-  }
-
-  /**
-   * @brief 把 OpenCV 检测到的 marker id/角点转换为标定用 object/image points。
-   *
-   * 只使用在 BoardMap 中能找到的 id；这样即使画面中出现无关 ArUco，也不会污染标定。
-   *
-   * @return true 表示至少收集到一个属于当前标定板的 marker。
-   */
-  static bool CollectPoints(const std::vector<std::vector<cv::Point2f>>& corners,
-                            const cv::Mat& ids, const BoardMap& board,
-                            std::vector<cv::Point3f>& object_points,
-                            std::vector<cv::Point2f>& image_points,
-                            int& used_markers)
-  {
-    object_points.clear();
-    image_points.clear();
-    used_markers = 0;
-    if (ids.empty())
-    {
-      return false;
-    }
-
-    for (int i = 0; i < ids.rows; ++i)
-    {
-      if (i >= static_cast<int>(corners.size()) || corners[i].size() < 4)
-      {
-        continue;
-      }
-
-      const int id = ids.at<int>(i, 0);
-      const auto marker = board.find(id);
-      // 忽略字典中存在但不属于当前 GShang 尺寸/布局的 marker。
-      if (marker == board.end())
-      {
-        continue;
-      }
-
-      for (int corner = 0; corner < 4; ++corner)
-      {
-        object_points.push_back(marker->second[corner]);
-        image_points.push_back(corners[i][corner]);
-      }
-      ++used_markers;
-    }
-    return used_markers > 0;
-  }
-
-  /**
-   * @brief 将输入图像转换为灰度视图/图像，供清晰度评估使用。
-   *
-   * 单通道输入直接返回原 Mat；三/四通道输入生成新的灰度 Mat。
-   */
-  static cv::Mat MakeGrayImage(const cv::Mat& image)
-  {
-    if (image.channels() == 1)
-    {
-      return image;
-    }
-
-    cv::Mat gray;
-    if (image.channels() == 3)
-    {
-      cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
-    }
-    else if (image.channels() == 4)
-    {
-      cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
-    }
-    return gray;
-  }
-
-  /**
-   * @brief 计算 marker 区域内的拉普拉斯方差作为清晰度指标。
-   *
-   * 只在 marker 多边形及轻微膨胀区域统计，避免背景纹理或屏幕边框影响运动模糊判断。
-   */
-  static double MarkerSharpnessScore(
-      const cv::Mat& image, const std::vector<std::vector<cv::Point2f>>& corners)
-  {
-    const cv::Mat gray = MakeGrayImage(image);
-    if (gray.empty())
-    {
-      return 0.0;
-    }
-
-    cv::Mat marker_mask = cv::Mat::zeros(gray.size(), CV_8UC1);
-    for (const auto& marker : corners)
-    {
-      if (marker.size() < 4)
-      {
-        continue;
-      }
-
-      std::array<cv::Point, 4> polygon{};
-      for (int i = 0; i < 4; ++i)
-      {
-        // fillConvexPoly 需要整数像素点，使用四舍五入保留角点所在区域。
-        polygon[static_cast<std::size_t>(i)] =
-            cv::Point{static_cast<int>(std::lround(marker[static_cast<std::size_t>(i)].x)),
-                      static_cast<int>(std::lround(marker[static_cast<std::size_t>(i)].y))};
-      }
-      cv::fillConvexPoly(marker_mask, polygon.data(), static_cast<int>(polygon.size()),
-                         cv::Scalar{255});
-    }
-
-    if (cv::countNonZero(marker_mask) < 16)
-    {
-      return 0.0;
-    }
-
-    // 膨胀一圈把 marker 边缘纳入统计，边缘越锐利，拉普拉斯方差越高。
-    cv::dilate(marker_mask, marker_mask, cv::Mat{}, {-1, -1}, 1);
-    cv::Mat laplacian;
-    cv::Laplacian(gray, laplacian, CV_64F, 3);
-
-    cv::Scalar mean;
-    cv::Scalar stddev;
-    cv::meanStdDev(laplacian, mean, stddev, marker_mask);
-    return stddev[0] * stddev[0];
-  }
-
-  /**
-   * @brief 把 OpenCV minAreaRect 角度规整到 [0, 180)。
-   *
-   * 标定板正反 180 度在近重复判断中等价，因此只保留半圆范围。
-   */
-  static double NormalizeBoardAngle(double angle_deg, const cv::Size2f& size)
-  {
-    if (size.width < size.height)
-    {
-      angle_deg += 90.0;
-    }
-
-    while (angle_deg < 0.0)
-    {
-      angle_deg += 180.0;
-    }
-    while (angle_deg >= 180.0)
-    {
-      angle_deg -= 180.0;
-    }
-    return angle_deg;
-  }
-
-  /**
-   * @brief 计算两个平面角度在 180 度周期下的最小差值。
-   */
-  static double AngleDeltaDeg(double lhs, double rhs)
-  {
-    double delta = std::fabs(lhs - rhs);
-    while (delta >= 180.0)
-    {
-      delta -= 180.0;
-    }
-    return delta > 90.0 ? 180.0 - delta : delta;
+    return VisionCaptureCalibrationBoard::MakeGShangBoard(
+        config.marker_mm, config.cols, config.rows, gshang_marker_cells,
+        gshang_square_cells);
   }
 
   /**
@@ -1022,56 +819,25 @@ class VisionCaptureCameraCalibration
    *
    * 这些指标不直接参与 OpenCV 标定，但用于在线采样去模糊、去重复，以及 views.csv 复盘。
    */
-  static void FillDetectionQuality(const cv::Mat& image, Detection& detection)
-  {
-    detection.sharpness_score =
-        MarkerSharpnessScore(image, detection.marker_corners);
-
-    if (detection.image_points.empty() || CameraInfoV.width == 0 ||
-        CameraInfoV.height == 0)
-    {
-      return;
-    }
-
-    const cv::Rect bounds = cv::boundingRect(detection.image_points);
-    const double image_width = static_cast<double>(CameraInfoV.width);
-    const double image_height = static_cast<double>(CameraInfoV.height);
-    detection.center_x_norm =
-        (static_cast<double>(bounds.x) + static_cast<double>(bounds.width) * 0.5) /
-        image_width;
-    detection.center_y_norm =
-        (static_cast<double>(bounds.y) + static_cast<double>(bounds.height) * 0.5) /
-        image_height;
-    detection.scale_norm =
-        std::sqrt(std::max(0.0, static_cast<double>(bounds.area())) /
-                  std::max(1.0, image_width * image_height));
-
-    if (detection.image_points.size() >= 4)
-    {
-      // 用全部角点的最小外接旋转矩形估计板面在图像内的旋转角。
-      const cv::RotatedRect rect = cv::minAreaRect(detection.image_points);
-      detection.angle_deg = NormalizeBoardAngle(rect.angle, rect.size);
-    }
-  }
-
   /**
-   * @brief 判断当前检测是否和已有样本过近。
+   * @brief 判断当前观测是否和已有样本过近。
    *
    * 调用方必须持有 mutex_，因为本函数遍历 accepted_views_ 并读取 config_ 阈值。
    */
-  bool IsNearDuplicateLocked(const Detection& detection) const
+  bool IsNearDuplicateLocked(const Observation& observation) const
   {
     for (const View& view : accepted_views_)
     {
       // 中心、尺度和角度都很接近时才视为重复；任一维度变化足够大则保留。
       const double center_delta =
-          std::hypot(detection.center_x_norm - view.center_x_norm,
-                     detection.center_y_norm - view.center_y_norm);
+          std::hypot(observation.center_x_norm - view.center_x_norm,
+                     observation.center_y_norm - view.center_y_norm);
       const double scale_delta =
-          std::fabs(std::log((detection.scale_norm + 1e-6) /
+          std::fabs(std::log((observation.scale_norm + 1e-6) /
                              (view.scale_norm + 1e-6)));
       const double angle_delta =
-          AngleDeltaDeg(detection.angle_deg, view.angle_deg);
+          VisionCaptureCalibrationBoard::AngleDeltaDeg(observation.angle_deg,
+                                                       view.angle_deg);
       if (center_delta < config_.min_center_delta_norm &&
           scale_delta < config_.min_scale_delta_log &&
           angle_delta < config_.min_angle_delta_deg)
@@ -1080,45 +846,6 @@ class VisionCaptureCameraCalibration
       }
     }
     return false;
-  }
-
-  /**
-   * @brief 使用平面单应性估计当前角点集的像素 RMS。
-   *
-   * 这是保存前标定的轻量前置检查：标定板是平面，正确角点应能被单应性较好解释。
-   */
-  static double HomographyRms(const std::vector<cv::Point3f>& object_points,
-                              const std::vector<cv::Point2f>& image_points)
-  {
-    if (object_points.size() < 4 || object_points.size() != image_points.size())
-    {
-      return 1e9;
-    }
-
-    std::vector<cv::Point2f> object_xy;
-    object_xy.reserve(object_points.size());
-    for (const auto& point : object_points)
-    {
-      // 标定板 z 恒为 0，单应性只需要平面坐标 x/y。
-      object_xy.emplace_back(point.x, point.y);
-    }
-
-    const cv::Mat homography = cv::findHomography(object_xy, image_points, 0);
-    if (homography.empty())
-    {
-      return 1e9;
-    }
-
-    std::vector<cv::Point2f> projected;
-    cv::perspectiveTransform(object_xy, projected, homography);
-
-    double sum2 = 0.0;
-    for (std::size_t i = 0; i < image_points.size(); ++i)
-    {
-      const cv::Point2f delta = projected[i] - image_points[i];
-      sum2 += delta.dot(delta);
-    }
-    return std::sqrt(sum2 / static_cast<double>(image_points.size()));
   }
 
   /**
@@ -1749,15 +1476,15 @@ class VisionCaptureCameraCalibration
    *
    * 图中绘制检测到的 marker 和该视角质量指标；写图失败只报警，不影响标定结果。
    */
-  static void SaveDebugImage(const cv::Mat& image, const Detection& detection,
+  static void SaveDebugImage(const cv::Mat& image, const Observation& observation,
                              const StoredView& stored)
   {
     cv::Mat debug = image.clone();
-    if (!detection.marker_ids.empty())
+    if (!observation.marker_ids.empty())
     {
       // 保留 OpenCV 原始角点绘制，方便人工复盘 id 和角点方向是否正确。
-      cv::aruco::drawDetectedMarkers(debug, detection.marker_corners,
-                                     detection.marker_ids);
+      cv::aruco::drawDetectedMarkers(debug, observation.marker_corners,
+                                     observation.marker_ids);
     }
 
     std::ostringstream label;
