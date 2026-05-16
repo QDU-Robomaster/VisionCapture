@@ -16,7 +16,7 @@ constructor_args:
       save_images: true
       save_metadata: true
       save_raw_imu: true
-      flush_every_n: 30
+      flush_every_n: 1
     preview:
       enabled: false
       preview_window_name: "vision_capture"
@@ -184,7 +184,7 @@ class VisionCapture : public LibXR::Application
     bool save_images = true;
     bool save_metadata = true;
     bool save_raw_imu = true;
-    uint32_t flush_every_n = 30;
+    uint32_t flush_every_n = 1;
   };
 
   struct BoardParams
