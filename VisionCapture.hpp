@@ -488,11 +488,7 @@ class VisionCapture : public LibXR::Application
                   << imu.linear_acceleration_xyz[2] << "," << image_path << ","
                   << (detection.detected ? 1 : 0) << ","
                   << detection.ids.size() << "," << JoinIds(detection.ids) << "\n";
-    if (cfg_.record.flush_every_n != 0 &&
-        frame_id % cfg_.record.flush_every_n == 0)
-    {
-      metadata_csv_.flush();
-    }
+    metadata_csv_.flush();
   }
 
  private:
