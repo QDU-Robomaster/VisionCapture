@@ -6,8 +6,8 @@
 
 - `record`：保存同步图像和每帧元数据。
 - `calibrate_camera`：判稳后保存标定样本，并用同一批图像求解相机内参。
-- `calibrate_handeye`：判稳后保存手眼标定样本；当前只保存数据，不求解手眼结果。
-- `calibrate`：同时保存标定样本并运行相机内参标定，数据也可用于后续手眼标定。
+- `calibrate_handeye`：判稳后保存手眼标定样本，并在 `solve` 时求解手眼外参。
+- `calibrate`：同时保存标定样本，并在 `solve` 时运行相机内参和手眼标定。
 
 `camera_calibration.enabled: true` 时，即使 `mode` 仍为 `record`，也会进入标定采样保存流程。
 
@@ -51,6 +51,17 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 
 `camera_info_snippet.txt` 会打印可粘贴到 `CameraInfo` 配置中的内参、畸变和投影矩阵。写入配置前应检查焦距、主点、畸变系数和重投影 RMS 是否合理。
 
+## 手眼标定
+
+手眼标定继续使用当前配置的 ArUco/GShang 标定板检测和 PnP 结果，不切换到圆点板。`solve` 命令会用已接受样本调用 OpenCV `calibrateRobotWorldHandEye`，假设每帧 `t_world2body = 0`。同步 IMU 四元数默认按公开本体系 `B` 表达：`x` 向右、`y` 向前、`z` 向上；如果实机发布的四元数仍有 IMU 安装轴差，可通过 `handeye_calibration.R_body2imu` 配置。
+
+输出文件位于当前采集目录：
+
+- `handeye.yml`：OpenCV FileStorage 格式结果，包含 `R_camera2body`、`t_camera2body`，并保留兼容字段 `R_camera2gimbal`、`t_camera2gimbal`，平移单位为 m。
+- `handeye_report.txt`：便于人工检查的文本报告。
+
+报告中同时给出可填入 `ArmorTracker.extrinsic.camera_mount_to_body` 的 `rotation(wxyz)` 和 `translation`。`handeye_calibration.min_samples` 控制求解所需的最少稳定样本数，默认 `6`。
+
 ## 采样判稳
 
 `calibration_sampling` 用于筛选相机和 IMU 都稳定的样本。它会检查：
@@ -62,7 +73,7 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 - 加速度模长、模长抖动和方向抖动。
 - 样本之间的位移和角度变化。
 
-该采样结果直接决定 `frames/` 和 `samples.csv` 中保存哪些样本。当前模块会采集和保存手眼标定数据，但不求解手眼标定结果。
+该采样结果直接决定 `frames/`、`samples.csv` 和手眼求解输入中保存哪些样本。
 
 ## 本地命令
 
@@ -73,5 +84,5 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 - `reset`：清空本轮采样状态。
 - `snapshot`：请求保存一帧。
 - `status`：打印当前采样状态。
-- `solve`：立即尝试相机内参求解，并打印当前手眼样本数。
+- `solve`：立即尝试相机内参求解和手眼标定求解。
 - `help`：打印命令列表。

@@ -53,6 +53,9 @@ constructor_args:
       max_acc_direction_jitter_deg: 2.0
       min_sample_translation_delta_m: 0.03
       min_sample_rotation_delta_deg: 5.0
+    handeye_calibration:
+      min_samples: 6
+      R_body2imu: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     control:
       stdin_enabled: false
     filter:
@@ -259,6 +262,89 @@ inline cv::Vec4d NormalizeQuatWxyz(const std::array<float, 4>& q)
 }
 
 /**
+ * @brief 将 wxyz 顺序四元数转换为旋转矩阵。
+ */
+inline cv::Mat QuatWxyzToRotationMatrix(const cv::Vec4d& q)
+{
+  const double w = q[0];
+  const double x = q[1];
+  const double y = q[2];
+  const double z = q[3];
+  return (cv::Mat_<double>(3, 3)
+          << 1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
+          2.0 * (x * z + y * w), 2.0 * (x * y + z * w),
+          1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w),
+          2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
+          1.0 - 2.0 * (x * x + y * y));
+}
+
+/**
+ * @brief 将 OpenCV 相机系 C 转到相机安装系 M。
+ *
+ * C: x 向右、y 向下、z 向前。M: x 向右、y 向前、z 向上。
+ */
+inline cv::Mat CameraToMountRotation()
+{
+  return (cv::Mat_<double>(3, 3) << 1.0, 0.0, 0.0,
+          0.0, 0.0, 1.0,
+          0.0, -1.0, 0.0);
+}
+
+/**
+ * @brief 将旋转矩阵转换为 wxyz 四元数。
+ */
+inline cv::Vec4d RotationMatrixToQuatWxyz(const cv::Mat& rotation)
+{
+  const double m00 = rotation.at<double>(0, 0);
+  const double m11 = rotation.at<double>(1, 1);
+  const double m22 = rotation.at<double>(2, 2);
+  const double trace = m00 + m11 + m22;
+  double w = 1.0;
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+  if (trace > 0.0)
+  {
+    const double s = std::sqrt(trace + 1.0) * 2.0;
+    w = 0.25 * s;
+    x = (rotation.at<double>(2, 1) - rotation.at<double>(1, 2)) / s;
+    y = (rotation.at<double>(0, 2) - rotation.at<double>(2, 0)) / s;
+    z = (rotation.at<double>(1, 0) - rotation.at<double>(0, 1)) / s;
+  }
+  else if (m00 > m11 && m00 > m22)
+  {
+    const double s = std::sqrt(1.0 + m00 - m11 - m22) * 2.0;
+    w = (rotation.at<double>(2, 1) - rotation.at<double>(1, 2)) / s;
+    x = 0.25 * s;
+    y = (rotation.at<double>(0, 1) + rotation.at<double>(1, 0)) / s;
+    z = (rotation.at<double>(0, 2) + rotation.at<double>(2, 0)) / s;
+  }
+  else if (m11 > m22)
+  {
+    const double s = std::sqrt(1.0 + m11 - m00 - m22) * 2.0;
+    w = (rotation.at<double>(0, 2) - rotation.at<double>(2, 0)) / s;
+    x = (rotation.at<double>(0, 1) + rotation.at<double>(1, 0)) / s;
+    y = 0.25 * s;
+    z = (rotation.at<double>(1, 2) + rotation.at<double>(2, 1)) / s;
+  }
+  else
+  {
+    const double s = std::sqrt(1.0 + m22 - m00 - m11) * 2.0;
+    w = (rotation.at<double>(1, 0) - rotation.at<double>(0, 1)) / s;
+    x = (rotation.at<double>(0, 2) + rotation.at<double>(2, 0)) / s;
+    y = (rotation.at<double>(1, 2) + rotation.at<double>(2, 1)) / s;
+    z = 0.25 * s;
+  }
+
+  const double norm = std::sqrt(w * w + x * x + y * y + z * z);
+  if (norm <= 1e-9)
+  {
+    return {1.0, 0.0, 0.0, 0.0};
+  }
+  return {w / norm, x / norm, y / norm, z / norm};
+}
+
+/**
  * @brief 计算两个四元数之间的最小旋转角。
  */
 inline double QuatAngularDistanceDeg(const cv::Vec4d& lhs, const cv::Vec4d& rhs)
@@ -404,6 +490,20 @@ class VisionCapture : public LibXR::Application
   };
 
   /**
+   * @brief 手眼标定求解配置。
+   */
+  struct HandEyeCalibrationParams
+  {
+    /// 触发求解需要的最少稳定样本数。
+    uint32_t min_samples = 6;
+    /// 公开本体系 B 到 IMU 四元数本体系的旋转，行优先 3x3。
+    std::array<double, 9> R_body2imu{
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0};
+  };
+
+  /**
    * @brief 本地命令配置。
    */
   struct ControlParams
@@ -428,6 +528,23 @@ class VisionCapture : public LibXR::Application
     Config(std::string_view mode_in, std::string_view output_dir_in,
            std::string_view session_name_in, RecordParams record_in,
            VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          filter(filter_in)
+    {
+    }
+
+    /**
+     * @brief 供填写相机标定配置项的生成代码使用。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
            CameraCalibrationParams camera_calibration_in, FilterParams filter_in)
         : mode(mode_in),
           output_dir(output_dir_in),
@@ -436,6 +553,27 @@ class VisionCapture : public LibXR::Application
           preview(preview_in),
           board(board_in),
           camera_calibration(camera_calibration_in),
+          filter(filter_in)
+    {
+    }
+
+    /**
+     * @brief 供填写相机标定和手眼标定配置项的生成代码使用。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           CameraCalibrationParams camera_calibration_in,
+           HandEyeCalibrationParams handeye_calibration_in,
+           FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          camera_calibration(camera_calibration_in),
+          handeye_calibration(handeye_calibration_in),
           filter(filter_in)
     {
     }
@@ -483,6 +621,53 @@ class VisionCapture : public LibXR::Application
     {
     }
 
+    /**
+     * @brief 完整配置，包含手眼标定参数。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           CameraCalibrationParams camera_calibration_in,
+           CalibrationSamplingParams calibration_sampling_in,
+           HandEyeCalibrationParams handeye_calibration_in,
+           FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          camera_calibration(camera_calibration_in),
+          calibration_sampling(calibration_sampling_in),
+          handeye_calibration(handeye_calibration_in),
+          filter(filter_in)
+    {
+    }
+
+    /**
+     * @brief 完整配置，包含手眼标定和本地控制参数。
+     */
+    Config(std::string_view mode_in, std::string_view output_dir_in,
+           std::string_view session_name_in, RecordParams record_in,
+           VisionPreview::RuntimeParam preview_in, BoardParams board_in,
+           CameraCalibrationParams camera_calibration_in,
+           CalibrationSamplingParams calibration_sampling_in,
+           HandEyeCalibrationParams handeye_calibration_in,
+           ControlParams control_in, FilterParams filter_in)
+        : mode(mode_in),
+          output_dir(output_dir_in),
+          session_name(session_name_in),
+          record(record_in),
+          preview(preview_in),
+          board(board_in),
+          camera_calibration(camera_calibration_in),
+          calibration_sampling(calibration_sampling_in),
+          handeye_calibration(handeye_calibration_in),
+          control(control_in),
+          filter(filter_in)
+    {
+    }
+
     /// 运行模式：`record`、`calibrate_camera`、`calibrate_handeye` 或 `calibrate`。
     std::string_view mode = "record";
     /// 输出根目录。
@@ -499,6 +684,8 @@ class VisionCapture : public LibXR::Application
     CameraCalibrationParams camera_calibration{};
     /// 标定采样判稳配置。
     CalibrationSamplingParams calibration_sampling{};
+    /// 手眼标定求解配置。
+    HandEyeCalibrationParams handeye_calibration{};
     /// 本地命令配置。
     ControlParams control{};
     /// 同步帧过滤配置。
@@ -707,13 +894,178 @@ class VisionCapture : public LibXR::Application
     }
     if (IsCalibrationDatasetMode())
     {
-      XR_LOG_WARN("VisionCapture control: handeye solver is not implemented yet, accepted_samples=%u",
-                  static_cast<unsigned>(samples));
+      if (ShouldRunHandEyeCalibration())
+      {
+        SolveHandEyeCalibration();
+      }
+      else
+      {
+        XR_LOG_INFO("VisionCapture control: handeye solver skipped in mode=%s accepted_samples=%u",
+                    VisionCaptureDetail::ToString(cfg_.mode).c_str(),
+                    static_cast<unsigned>(samples));
+      }
     }
     else if (!solved_camera)
     {
       XR_LOG_WARN("VisionCapture control: no calibration solver active");
     }
+  }
+
+  /**
+   * @brief 用已接受样本求解相机到公开本体系 B 的手眼外参。
+   */
+  bool SolveHandEyeCalibration()
+  {
+    std::vector<StableSample> samples;
+    {
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      samples = accepted_calibration_samples_;
+    }
+
+    const uint32_t min_samples =
+        std::max<uint32_t>(3, cfg_.handeye_calibration.min_samples);
+    if (samples.size() < min_samples)
+    {
+      XR_LOG_WARN("VisionCapture handeye: need at least %u samples, got %u",
+                  static_cast<unsigned>(min_samples),
+                  static_cast<unsigned>(samples.size()));
+      return false;
+    }
+
+    try
+    {
+      std::vector<cv::Mat> rvec_board2camera;
+      std::vector<cv::Mat> t_board2camera;
+      std::vector<cv::Mat> R_world2body;
+      std::vector<cv::Mat> t_world2body;
+      rvec_board2camera.reserve(samples.size());
+      t_board2camera.reserve(samples.size());
+      R_world2body.reserve(samples.size());
+      t_world2body.reserve(samples.size());
+
+      const auto& rb2i = cfg_.handeye_calibration.R_body2imu;
+      const cv::Mat R_body2imu =
+          (cv::Mat_<double>(3, 3) << rb2i[0], rb2i[1], rb2i[2],
+           rb2i[3], rb2i[4], rb2i[5], rb2i[6], rb2i[7], rb2i[8]);
+
+      for (const StableSample& sample : samples)
+      {
+        const cv::Mat R_imu2world =
+            VisionCaptureDetail::QuatWxyzToRotationMatrix(sample.quat);
+        const cv::Mat R_body2world = R_imu2world * R_body2imu;
+
+        R_world2body.push_back(R_body2world.t());
+        t_world2body.push_back(cv::Mat::zeros(3, 1, CV_64F));
+        rvec_board2camera.push_back(sample.rvec.clone());
+        t_board2camera.push_back(sample.tvec.clone());
+      }
+
+      cv::Mat R_world2board;
+      cv::Mat t_world2board;
+      cv::Mat R_body2camera;
+      cv::Mat t_body2camera;
+      cv::calibrateRobotWorldHandEye(
+          rvec_board2camera, t_board2camera, R_world2body, t_world2body,
+          R_world2board, t_world2board, R_body2camera, t_body2camera);
+
+      cv::Mat R_camera2body;
+      cv::transpose(R_body2camera, R_camera2body);
+      const cv::Mat t_camera2body = -R_camera2body * t_body2camera;
+      const cv::Mat R_mount2body =
+          R_camera2body * VisionCaptureDetail::CameraToMountRotation().t();
+      const cv::Vec4d q_mount2body =
+          VisionCaptureDetail::RotationMatrixToQuatWxyz(R_mount2body);
+
+      const std::filesystem::path yaml_path = output_dir_ / "handeye.yml";
+      const std::filesystem::path report_path = output_dir_ / "handeye_report.txt";
+      WriteHandEyeYaml(yaml_path, R_body2imu, R_camera2body, t_camera2body,
+                       R_mount2body, q_mount2body, R_world2board, t_world2board,
+                       static_cast<uint32_t>(samples.size()));
+      WriteHandEyeReport(report_path, R_camera2body, t_camera2body,
+                         R_mount2body, q_mount2body,
+                         R_world2board, t_world2board,
+                         static_cast<uint32_t>(samples.size()));
+
+      XR_LOG_PASS("VisionCapture handeye solved: samples=%u result=%s",
+                  static_cast<unsigned>(samples.size()),
+                  yaml_path.string().c_str());
+      return true;
+    }
+    catch (const cv::Exception& e)
+    {
+      XR_LOG_ERROR("VisionCapture handeye solve failed: %s", e.what());
+    }
+    catch (const std::exception& e)
+    {
+      XR_LOG_ERROR("VisionCapture handeye write failed: %s", e.what());
+    }
+    return false;
+  }
+
+  /**
+   * @brief 写出手眼标定 YAML，单位为 m。
+   */
+  void WriteHandEyeYaml(const std::filesystem::path& path,
+                        const cv::Mat& R_body2imu,
+                        const cv::Mat& R_camera2body,
+                        const cv::Mat& t_camera2body,
+                        const cv::Mat& R_mount2body,
+                        const cv::Vec4d& q_mount2body,
+                        const cv::Mat& R_world2board,
+                        const cv::Mat& t_world2board,
+                        uint32_t sample_count) const
+  {
+    cv::FileStorage fs(path.string(), cv::FileStorage::WRITE);
+    fs << "sample_count" << static_cast<int>(sample_count);
+    fs << "method" << "calibrateRobotWorldHandEye";
+    fs << "translation_unit" << "m";
+    fs << "body_frame" << "B: x right, y forward, z up";
+    fs << "camera_frame" << "C: OpenCV, x right, y down, z forward";
+    fs << "mount_frame" << "M: x right, y forward, z up";
+    fs << "R_body2imu" << R_body2imu;
+    fs << "R_camera2body" << R_camera2body;
+    fs << "t_camera2body" << t_camera2body;
+    fs << "R_camera2gimbal" << R_camera2body;
+    fs << "t_camera2gimbal" << t_camera2body;
+    fs << "R_mount2body" << R_mount2body;
+    fs << "camera_mount_to_body_rotation_wxyz"
+       << std::vector<double>{q_mount2body[0], q_mount2body[1],
+                              q_mount2body[2], q_mount2body[3]};
+    fs << "camera_mount_to_body_translation" << t_camera2body;
+    fs << "R_world2board" << R_world2board;
+    fs << "t_world2board" << t_world2board;
+  }
+
+  /**
+   * @brief 写出便于人工检查的手眼标定报告。
+   */
+  void WriteHandEyeReport(const std::filesystem::path& path,
+                          const cv::Mat& R_camera2body,
+                          const cv::Mat& t_camera2body,
+                          const cv::Mat& R_mount2body,
+                          const cv::Vec4d& q_mount2body,
+                          const cv::Mat& R_world2board,
+                          const cv::Mat& t_world2board,
+                          uint32_t sample_count) const
+  {
+    std::ofstream out(path, std::ios::out);
+    out << "method=calibrateRobotWorldHandEye\n";
+    out << "sample_count=" << sample_count << "\n";
+    out << "translation_unit=m\n";
+    out << "body_frame=B x_right y_forward z_up\n";
+    out << "camera_frame=C OpenCV x_right y_down z_forward\n";
+    out << "mount_frame=M x_right y_forward z_up\n";
+    out << "assumption=t_world2body is zero for every sample\n";
+    out << "R_camera2body=\n" << R_camera2body << "\n";
+    out << "t_camera2body=\n" << t_camera2body << "\n";
+    out << "ArmorTracker camera_mount_to_body.rotation(wxyz)=["
+        << q_mount2body[0] << ", " << q_mount2body[1] << ", "
+        << q_mount2body[2] << ", " << q_mount2body[3] << "]\n";
+    out << "ArmorTracker camera_mount_to_body.translation=\n"
+        << t_camera2body << "\n";
+    out << "R_mount2body=\n" << R_mount2body << "\n";
+    out << "R_world2board=\n" << R_world2board << "\n";
+    out << "t_world2board=\n" << t_world2board << "\n";
   }
 
   /**
@@ -936,6 +1288,14 @@ class VisionCapture : public LibXR::Application
   {
     return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye" ||
            cfg_.mode == "calibrate_camera" || cfg_.camera_calibration.enabled;
+  }
+
+  /**
+   * @brief 当前模式是否需要求解手眼标定。
+   */
+  bool ShouldRunHandEyeCalibration() const
+  {
+    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye";
   }
 
   /**
