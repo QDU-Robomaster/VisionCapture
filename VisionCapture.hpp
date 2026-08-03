@@ -58,7 +58,7 @@ constructor_args:
     filter:
       require_synced_imu: true
       max_image_imu_dt_us: 2000
-  sync: '@camera_frame_sync'
+  sync: '@nullptr'
 template_args:
   - Info:
       width: 1280
@@ -92,6 +92,7 @@ depends:
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <opencv2/aruco.hpp>
@@ -509,12 +510,14 @@ class VisionCapture : public LibXR::Application
    * @brief 构造同步采集模块并启动工作线程。
    */
   VisionCapture(LibXR::HardwareContainer&, LibXR::ApplicationManager& app,
-                Config cfg, Sync& sync)
+                Config cfg, Sync* sync)
       : cfg_(cfg),
         sync_(sync),
         dictionary_(cv::aruco::getPredefinedDictionary(
             VisionCaptureDetail::ArucoDictionaryId(cfg_.board.dictionary)))
   {
+    ASSERT(sync_ != nullptr);
+
     NormalizeCalibrationConfig();
     detector_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
     preview_.Start(cfg_.preview);
@@ -532,6 +535,12 @@ class VisionCapture : public LibXR::Application
                              LibXR::Thread::Priority::LOW);
     }
     app.Register(*this);
+  }
+
+  VisionCapture(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
+                Config cfg, Sync& sync)
+      : VisionCapture(hw, app, std::move(cfg), &sync)
+  {
   }
 
   /**
@@ -562,14 +571,17 @@ class VisionCapture : public LibXR::Application
    */
   static void WorkerThreadFun(VisionCapture* self)
   {
-    XR_LOG_INFO("VisionCapture worker starting: image=%s imu=%s",
-                self->sync_.ImageTopicName(), self->sync_.ImuTopicName());
+    ASSERT(self->sync_ != nullptr);
+    Sync& sync = *self->sync_;
 
-    typename Sync::Subscriber subscriber(self->sync_);
+    XR_LOG_INFO("VisionCapture worker starting: image=%s imu=%s",
+                sync.ImageTopicName(), sync.ImuTopicName());
+
+    typename Sync::Subscriber subscriber(sync);
     if (!subscriber.Valid())
     {
       XR_LOG_ERROR("VisionCapture failed to attach sync stream: image=%s",
-                   self->sync_.ImageTopicName());
+                   sync.ImageTopicName());
       return;
     }
 
@@ -1517,7 +1529,7 @@ class VisionCapture : public LibXR::Application
   /// 模块运行配置。
   Config cfg_{};
   /// 同步帧来源。
-  Sync& sync_;
+  Sync* sync_{nullptr};
   /// 可选预览输出。
   VisionPreview preview_{};
   /// 同步帧消费线程。
