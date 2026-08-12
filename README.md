@@ -21,7 +21,10 @@
 
 - `samples.csv`：同步图像时间戳、IMU 时间戳、四元数、角速度、加速度、图像文件名、标定板检测结果和采样判定。
 - `frames/`：保存的原始图像。
-- `camera_info.txt`：本次运行使用的编译期 CameraInfo。
+- `frame_layout.txt`：编译期固定的帧存储布局。
+- `camera_calibration.txt`：原生传感器坐标系下的固定标定。
+- `frame_geometry.txt`：首个有效帧携带的 ROI、下采样、翻转和 epoch。
+- `camera_info.txt`：由上述三项派生的帧坐标兼容快照，保留给旧记录工具。
 - `preview`：可选窗口或 Web 预览。
 
 标定模式只保存通过判稳的样本；被判稳拒绝的帧不会写入 `frames/` 和 `samples.csv`。
@@ -49,7 +52,10 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 - `camera_info_snippet.txt`
 - 调试图像
 
-`camera_info_snippet.txt` 会打印可粘贴到 `CameraInfo` 配置中的内参、畸变和投影矩阵。写入配置前应检查焦距、主点、畸变系数和重投影 RMS 是否合理。
+`camera_info_snippet.txt` 文件名为兼容旧产物而保留，内容是可粘贴到 xrobot YAML 的
+`MainFrameLayout` 与原生 `CameraCalibration` 片段。写入配置前应检查原生尺寸、焦距、
+主点、畸变系数和重投影 RMS 是否合理。离群阈值、`rms`、`views.csv` 和质量报告中的
+重投影误差均使用当前帧像素；`calibration.yml` 另存 `native_rms` 供原生坐标诊断。
 
 ## 采样判稳
 
