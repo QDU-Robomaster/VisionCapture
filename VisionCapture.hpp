@@ -60,16 +60,11 @@ constructor_args:
       max_image_imu_dt_us: 2000
   sync: '@nullptr'
 template_args:
-  - Info:
-      width: 1280
-      height: 720
-      step: 3840
+  - Layout:
+      width: 720
+      height: 540
+      step: 2160
       encoding: CameraTypes::Encoding::BGR8
-      camera_matrix: [800.0, 0.0, 640.0, 0.0, 800.0, 360.0, 0.0, 0.0, 1.0]
-      distortion_model: CameraTypes::DistortionModel::PLUMB_BOB
-      distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
-      rectification_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      projection_matrix: [800.0, 0.0, 640.0, 0.0, 0.0, 800.0, 360.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 required_hardware: []
 depends:
   - qdu-future/CameraFrameSync
@@ -88,23 +83,23 @@ depends:
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
+#include <opencv2/aruco.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include <opencv2/aruco.hpp>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-
 #include "CameraFrameSync.hpp"
-#include "VisionPreview.hpp"
 #include "VisionCaptureCalibrationBoard.hpp"
 #include "VisionCaptureCameraCalibration.hpp"
+#include "VisionPreview.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
 #include "logger.hpp"
@@ -164,25 +159,24 @@ inline int ArucoDictionaryId(std::string_view name)
  *
  * 返回的 Mat 不拥有像素内存，只在传入图像帧有效期间使用。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-cv::Mat MakeImageView(
-    const typename CameraFrameSync<CameraInfoV>::ImageFrame& image)
+template <CameraTypes::FrameLayout FrameLayoutV>
+cv::Mat MakeImageView(const typename CameraFrameSync<FrameLayoutV>::ImageFrame& image)
 {
-  const int width = static_cast<int>(CameraInfoV.width);
-  const int height = static_cast<int>(CameraInfoV.height);
-  const size_t step = static_cast<size_t>(CameraInfoV.step);
+  const int width = static_cast<int>(image.geometry.width);
+  const int height = static_cast<int>(image.geometry.height);
+  const size_t step = static_cast<size_t>(image.geometry.step);
   auto* data = const_cast<uint8_t*>(image.data.data());
-  if constexpr (CameraInfoV.encoding == CameraTypes::Encoding::BGR8 ||
-                CameraInfoV.encoding == CameraTypes::Encoding::RGB8)
+  if constexpr (FrameLayoutV.encoding == CameraTypes::Encoding::BGR8 ||
+                FrameLayoutV.encoding == CameraTypes::Encoding::RGB8)
   {
     return cv::Mat(height, width, CV_8UC3, data, step);
   }
-  else if constexpr (CameraInfoV.encoding == CameraTypes::Encoding::BGRA8 ||
-                     CameraInfoV.encoding == CameraTypes::Encoding::RGBA8)
+  else if constexpr (FrameLayoutV.encoding == CameraTypes::Encoding::BGRA8 ||
+                     FrameLayoutV.encoding == CameraTypes::Encoding::RGBA8)
   {
     return cv::Mat(height, width, CV_8UC4, data, step);
   }
-  else if constexpr (CameraInfoV.encoding == CameraTypes::Encoding::MONO8)
+  else if constexpr (FrameLayoutV.encoding == CameraTypes::Encoding::MONO8)
   {
     return cv::Mat(height, width, CV_8UC1, data, step);
   }
@@ -264,25 +258,25 @@ inline cv::Vec4d NormalizeQuatWxyz(const std::array<float, 4>& q)
  */
 inline double QuatAngularDistanceDeg(const cv::Vec4d& lhs, const cv::Vec4d& rhs)
 {
-  const double dot = std::fabs(lhs[0] * rhs[0] + lhs[1] * rhs[1] +
-                              lhs[2] * rhs[2] + lhs[3] * rhs[3]);
+  const double dot =
+      std::fabs(lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2] + lhs[3] * rhs[3]);
   return RadToDeg(2.0 * std::acos(VisionCaptureCalibrationBoard::ClampUnit(dot)));
 }
 
 /**
  * @brief 计算两个 Rodrigues 旋转向量之间的最小旋转角。
  */
-inline double RotationDistanceDeg(const cv::Mat& lhs_rvec,
-                                  const cv::Mat& rhs_rvec)
+inline double RotationDistanceDeg(const cv::Mat& lhs_rvec, const cv::Mat& rhs_rvec)
 {
   cv::Mat lhs;
   cv::Mat rhs;
   cv::Rodrigues(lhs_rvec, lhs);
   cv::Rodrigues(rhs_rvec, rhs);
   const cv::Mat delta = lhs * rhs.t();
-  const double trace = delta.at<double>(0, 0) + delta.at<double>(1, 1) +
-                       delta.at<double>(2, 2);
-  return RadToDeg(std::acos(VisionCaptureCalibrationBoard::ClampUnit((trace - 1.0) * 0.5)));
+  const double trace =
+      delta.at<double>(0, 0) + delta.at<double>(1, 1) + delta.at<double>(2, 2);
+  return RadToDeg(
+      std::acos(VisionCaptureCalibrationBoard::ClampUnit((trace - 1.0) * 0.5)));
 }
 }  // namespace VisionCaptureDetail
 
@@ -292,18 +286,25 @@ inline double RotationDistanceDeg(const cv::Mat& lhs_rvec,
  * 模块从 CameraFrameSync 读取同步帧，可保存图像/IMU 元数据、显示预览、
  * 执行相机内参标定采样，并筛选后续手眼标定所需的稳定样本。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
+template <CameraTypes::FrameLayout FrameLayoutV>
 class VisionCapture : public LibXR::Application
 {
  public:
   /// 对应的 CameraFrameSync 类型。
-  using Sync = CameraFrameSync<CameraInfoV>;
+  using Sync = CameraFrameSync<FrameLayoutV>;
   /// 同步后的图像帧类型。
   using ImageFrame = typename Sync::ImageFrame;
   /// 同步后的 IMU 数据类型。
   using ImuStamped = typename Sync::ImuStamped;
   /// 图像和 IMU 合包类型。
   using SyncedFrame = typename Sync::SyncedFrame;
+  /// 原生传感器坐标系下的不可变相机标定。
+  using CameraCalibration = typename Sync::CameraCalibration;
+  /// 单帧到原生传感器坐标系的采样映射。
+  using FrameGeometry = CameraTypes::FrameGeometry;
+
+  /// 编译期固定的帧存储布局。
+  static inline constexpr auto frame_layout = Sync::frame_layout;
 
   /**
    * @brief 同步帧记录配置。
@@ -448,8 +449,7 @@ class VisionCapture : public LibXR::Application
            std::string_view session_name_in, RecordParams record_in,
            VisionPreview::RuntimeParam preview_in, BoardParams board_in,
            CameraCalibrationParams camera_calibration_in,
-           CalibrationSamplingParams calibration_sampling_in,
-           FilterParams filter_in)
+           CalibrationSamplingParams calibration_sampling_in, FilterParams filter_in)
         : mode(mode_in),
           output_dir(output_dir_in),
           session_name(session_name_in),
@@ -469,8 +469,8 @@ class VisionCapture : public LibXR::Application
            std::string_view session_name_in, RecordParams record_in,
            VisionPreview::RuntimeParam preview_in, BoardParams board_in,
            CameraCalibrationParams camera_calibration_in,
-           CalibrationSamplingParams calibration_sampling_in,
-           ControlParams control_in, FilterParams filter_in)
+           CalibrationSamplingParams calibration_sampling_in, ControlParams control_in,
+           FilterParams filter_in)
         : mode(mode_in),
           output_dir(output_dir_in),
           session_name(session_name_in),
@@ -509,12 +509,14 @@ class VisionCapture : public LibXR::Application
   /**
    * @brief 构造同步采集模块并启动工作线程。
    */
-  VisionCapture(LibXR::HardwareContainer&, LibXR::ApplicationManager& app,
-                Config cfg, Sync* sync)
+  VisionCapture(LibXR::HardwareContainer&, LibXR::ApplicationManager& app, Config cfg,
+                Sync* sync)
       : cfg_(cfg),
         sync_(sync),
+        calibration_(sync != nullptr ? sync->Calibration() : CameraCalibration{}),
         dictionary_(cv::aruco::getPredefinedDictionary(
-            VisionCaptureDetail::ArucoDictionaryId(cfg_.board.dictionary)))
+            VisionCaptureDetail::ArucoDictionaryId(cfg_.board.dictionary))),
+        camera_calibration_(calibration_)
   {
     ASSERT(sync_ != nullptr);
 
@@ -537,8 +539,8 @@ class VisionCapture : public LibXR::Application
     app.Register(*this);
   }
 
-  VisionCapture(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                Config cfg, Sync& sync)
+  VisionCapture(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app, Config cfg,
+                Sync& sync)
       : VisionCapture(hw, app, std::move(cfg), &sync)
   {
   }
@@ -555,14 +557,13 @@ class VisionCapture : public LibXR::Application
     const uint64_t accepted = sampling_accepted_.exchange(0);
     const uint64_t rejected = sampling_rejected_.exchange(0);
     const std::string status = BuildStatusLine();
-    XR_LOG_INFO("VisionCapture monitor: frames=%llu saved=%llu boards=%llu "
-                "pnp_ok=%llu accepted=%llu rejected=%llu %s",
-                static_cast<unsigned long long>(frames),
-                static_cast<unsigned long long>(saved),
-                static_cast<unsigned long long>(boards),
-                static_cast<unsigned long long>(pnp_ok),
-                static_cast<unsigned long long>(accepted),
-                static_cast<unsigned long long>(rejected), status.c_str());
+    XR_LOG_INFO(
+        "VisionCapture monitor: frames=%llu saved=%llu boards=%llu "
+        "pnp_ok=%llu accepted=%llu rejected=%llu %s",
+        static_cast<unsigned long long>(frames), static_cast<unsigned long long>(saved),
+        static_cast<unsigned long long>(boards), static_cast<unsigned long long>(pnp_ok),
+        static_cast<unsigned long long>(accepted),
+        static_cast<unsigned long long>(rejected), status.c_str());
   }
 
  private:
@@ -574,8 +575,8 @@ class VisionCapture : public LibXR::Application
     ASSERT(self->sync_ != nullptr);
     Sync& sync = *self->sync_;
 
-    XR_LOG_INFO("VisionCapture worker starting: image=%s imu=%s",
-                sync.ImageTopicName(), sync.ImuTopicName());
+    XR_LOG_INFO("VisionCapture worker starting: image=%s imu=%s", sync.ImageTopicName(),
+                sync.ImuTopicName());
 
     typename Sync::Subscriber subscriber(sync);
     if (!subscriber.Valid())
@@ -596,8 +597,7 @@ class VisionCapture : public LibXR::Application
       }
       if (wait_ans != LibXR::ErrorCode::OK)
       {
-        XR_LOG_ERROR("VisionCapture sync wait failed err=%d",
-                     static_cast<int>(wait_ans));
+        XR_LOG_ERROR("VisionCapture sync wait failed err=%d", static_cast<int>(wait_ans));
         return;
       }
       self->ProcessFrame(frame);
@@ -609,7 +609,9 @@ class VisionCapture : public LibXR::Application
    */
   static void ControlThreadFun(VisionCapture* self)
   {
-    XR_LOG_INFO("VisionCapture stdin control ready: help/status/start/pause/reset/solve/snapshot");
+    XR_LOG_INFO(
+        "VisionCapture stdin control ready: "
+        "help/status/start/pause/reset/solve/snapshot");
     std::string line;
     while (std::getline(std::cin, line))
     {
@@ -623,15 +625,13 @@ class VisionCapture : public LibXR::Application
    */
   void HandleControlCommand(std::string_view command)
   {
-    while (!command.empty() &&
-           (command.front() == ' ' || command.front() == '\t' ||
-            command.front() == '\r' || command.front() == '\n'))
+    while (!command.empty() && (command.front() == ' ' || command.front() == '\t' ||
+                                command.front() == '\r' || command.front() == '\n'))
     {
       command.remove_prefix(1);
     }
-    while (!command.empty() &&
-           (command.back() == ' ' || command.back() == '\t' ||
-            command.back() == '\r' || command.back() == '\n'))
+    while (!command.empty() && (command.back() == ' ' || command.back() == '\t' ||
+                                command.back() == '\r' || command.back() == '\n'))
     {
       command.remove_suffix(1);
     }
@@ -719,8 +719,10 @@ class VisionCapture : public LibXR::Application
     }
     if (IsCalibrationDatasetMode())
     {
-      XR_LOG_WARN("VisionCapture control: handeye solver is not implemented yet, accepted_samples=%u",
-                  static_cast<unsigned>(samples));
+      XR_LOG_WARN(
+          "VisionCapture control: handeye solver is not implemented yet, "
+          "accepted_samples=%u",
+          static_cast<unsigned>(samples));
     }
     else if (!solved_camera)
     {
@@ -759,8 +761,7 @@ class VisionCapture : public LibXR::Application
     std::ostringstream out;
     out << "mode=" << cfg_.mode
         << " sampling=" << (sampling_running_.load(std::memory_order_acquire) ? 1 : 0)
-        << " accepted_total=" << samples
-        << " last_reason=" << last_reject_reason_
+        << " accepted_total=" << samples << " last_reason=" << last_reject_reason_
         << " last_pnp_rms_px=" << last_pnp_rms_px_
         << " last_gyro_norm_dps=" << last_gyro_norm_dps_
         << " last_acc_norm_mps2=" << last_acc_norm_mps2_;
@@ -775,8 +776,7 @@ class VisionCapture : public LibXR::Application
     session_name_ = cfg_.session_name.empty()
                         ? VisionCaptureDetail::MakeTimestampSessionName()
                         : VisionCaptureDetail::ToString(cfg_.session_name);
-    output_dir_ = std::filesystem::path(
-                      VisionCaptureDetail::ToString(cfg_.output_dir)) /
+    output_dir_ = std::filesystem::path(VisionCaptureDetail::ToString(cfg_.output_dir)) /
                   session_name_;
     frames_dir_ = output_dir_ / "frames";
 
@@ -786,45 +786,144 @@ class VisionCapture : public LibXR::Application
       if (cfg_.record.save_metadata)
       {
         metadata_csv_.open(output_dir_ / "samples.csv", std::ios::out);
-        metadata_csv_
-            << "frame_id,image_timestamp_us,imu_timestamp_us,dt_us,"
-               "qw,qx,qy,qz,gx,gy,gz,ax,ay,az,image_path,"
-               "board_detected,marker_count,marker_ids,"
-               "accepted,reject_reason,pnp_ok,pnp_rms_px,"
-               "pnp_t_jitter_m,pnp_r_jitter_deg,imu_r_jitter_deg,"
-               "gyro_norm_dps,acc_norm_mps2,acc_norm_error_mps2,"
-               "acc_norm_jitter_mps2,acc_dir_jitter_deg\n";
+        metadata_csv_ << "frame_id,image_timestamp_us,imu_timestamp_us,dt_us,"
+                         "qw,qx,qy,qz,gx,gy,gz,ax,ay,az,image_path,"
+                         "board_detected,marker_count,marker_ids,"
+                         "accepted,reject_reason,pnp_ok,pnp_rms_px,"
+                         "pnp_t_jitter_m,pnp_r_jitter_deg,imu_r_jitter_deg,"
+                         "gyro_norm_dps,acc_norm_mps2,acc_norm_error_mps2,"
+                         "acc_norm_jitter_mps2,acc_dir_jitter_deg\n";
       }
-      WriteCameraInfoSnapshot();
+      WriteStaticCameraSnapshots();
     }
 
-    XR_LOG_PASS("VisionCapture output session=%s dir=%s",
-                session_name_.c_str(), output_dir_.string().c_str());
+    XR_LOG_PASS("VisionCapture output session=%s dir=%s", session_name_.c_str(),
+                output_dir_.string().c_str());
+  }
+
+  template <std::size_t Size>
+  static void WriteArrayLine(std::ostream& out, std::string_view name,
+                             const std::array<double, Size>& values)
+  {
+    out << name << "=";
+    for (std::size_t i = 0; i < values.size(); ++i)
+    {
+      if (i != 0)
+      {
+        out << ",";
+      }
+      out << values[i];
+    }
+    out << "\n";
   }
 
   /**
-   * @brief 将当前 CameraInfoV 写入采集目录，方便复盘配置来源。
+   * @brief 分别保存固定帧布局和原生相机标定。
    */
-  void WriteCameraInfoSnapshot()
+  void WriteStaticCameraSnapshots()
   {
-    std::ofstream out(output_dir_ / "camera_info.txt", std::ios::out);
-    out << "width=" << CameraInfoV.width << "\n";
-    out << "height=" << CameraInfoV.height << "\n";
-    out << "step=" << CameraInfoV.step << "\n";
-    out << "encoding=" << static_cast<int>(CameraInfoV.encoding) << "\n";
-    out << "camera_matrix=";
-    for (size_t i = 0; i < CameraInfoV.camera_matrix.size(); ++i)
     {
-      if (i != 0) out << ",";
-      out << CameraInfoV.camera_matrix[i];
+      std::ofstream out(output_dir_ / "frame_layout.txt", std::ios::out);
+      out << "width=" << frame_layout.width << "\n";
+      out << "height=" << frame_layout.height << "\n";
+      out << "step=" << frame_layout.step << "\n";
+      out << "encoding=" << static_cast<int>(frame_layout.encoding) << "\n";
     }
-    out << "\ndistortion_coefficients=";
-    for (size_t i = 0; i < CameraInfoV.distortion_coefficients.size(); ++i)
     {
-      if (i != 0) out << ",";
-      out << CameraInfoV.distortion_coefficients[i];
+      std::ofstream out(output_dir_ / "camera_calibration.txt", std::ios::out);
+      out << std::setprecision(17);
+      out << "native_width=" << calibration_.native_width << "\n";
+      out << "native_height=" << calibration_.native_height << "\n";
+      out << "distortion_model=" << static_cast<int>(calibration_.distortion_model)
+          << "\n";
+      WriteArrayLine(out, "camera_matrix", calibration_.camera_matrix);
+      WriteArrayLine(out, "distortion_coefficients",
+                     calibration_.distortion_coefficients);
+      WriteArrayLine(out, "rectification_matrix", calibration_.rectification_matrix);
+      WriteArrayLine(out, "projection_matrix", calibration_.projection_matrix);
     }
-    out << "\n";
+  }
+
+  /**
+   * @brief 从原生 K 和当前采样几何派生兼容旧记录工具的帧坐标 K。
+   */
+  std::array<double, 9> FrameCameraMatrix(const FrameGeometry& geometry) const
+  {
+    const auto& native = calibration_.camera_matrix;
+    const double scale_x =
+        CameraTypes::HasGeometryFlag(geometry, CameraTypes::FRAME_GEOMETRY_REVERSE_X)
+            ? -1.0 / static_cast<double>(geometry.decimation_x)
+            : 1.0 / static_cast<double>(geometry.decimation_x);
+    const double scale_y =
+        CameraTypes::HasGeometryFlag(geometry, CameraTypes::FRAME_GEOMETRY_REVERSE_Y)
+            ? -1.0 / static_cast<double>(geometry.decimation_y)
+            : 1.0 / static_cast<double>(geometry.decimation_y);
+    const double translate_x =
+        CameraTypes::HasGeometryFlag(geometry, CameraTypes::FRAME_GEOMETRY_REVERSE_X)
+            ? static_cast<double>(geometry.width - 1U) +
+                  (static_cast<double>(geometry.roi_offset_x_native) +
+                   static_cast<double>(geometry.sample_phase_x_native)) /
+                      static_cast<double>(geometry.decimation_x)
+            : -(static_cast<double>(geometry.roi_offset_x_native) +
+                static_cast<double>(geometry.sample_phase_x_native)) /
+                  static_cast<double>(geometry.decimation_x);
+    const double translate_y =
+        CameraTypes::HasGeometryFlag(geometry, CameraTypes::FRAME_GEOMETRY_REVERSE_Y)
+            ? static_cast<double>(geometry.height - 1U) +
+                  (static_cast<double>(geometry.roi_offset_y_native) +
+                   static_cast<double>(geometry.sample_phase_y_native)) /
+                      static_cast<double>(geometry.decimation_y)
+            : -(static_cast<double>(geometry.roi_offset_y_native) +
+                static_cast<double>(geometry.sample_phase_y_native)) /
+                  static_cast<double>(geometry.decimation_y);
+
+    std::array<double, 9> frame{};
+    for (std::size_t col = 0; col < 3; ++col)
+    {
+      frame[col] = scale_x * native[col] + translate_x * native[6 + col];
+      frame[3 + col] = scale_y * native[3 + col] + translate_y * native[6 + col];
+      frame[6 + col] = native[6 + col];
+    }
+    return frame;
+  }
+
+  /**
+   * @brief 首帧到达时保存 geometry，并保留旧 camera_info.txt 派生快照。
+   */
+  void WriteFrameGeometrySnapshot(const FrameGeometry& geometry)
+  {
+    if (frame_geometry_snapshot_written_ || !cfg_.record.enabled)
+    {
+      return;
+    }
+
+    {
+      std::ofstream out(output_dir_ / "frame_geometry.txt", std::ios::out);
+      out << std::setprecision(17);
+      out << "epoch=" << geometry.epoch << "\n";
+      out << "width=" << geometry.width << "\n";
+      out << "height=" << geometry.height << "\n";
+      out << "step=" << geometry.step << "\n";
+      out << "roi_offset_x_native=" << geometry.roi_offset_x_native << "\n";
+      out << "roi_offset_y_native=" << geometry.roi_offset_y_native << "\n";
+      out << "decimation_x=" << geometry.decimation_x << "\n";
+      out << "decimation_y=" << geometry.decimation_y << "\n";
+      out << "flags=" << geometry.flags << "\n";
+      out << "sample_phase_x_native=" << geometry.sample_phase_x_native << "\n";
+      out << "sample_phase_y_native=" << geometry.sample_phase_y_native << "\n";
+    }
+    {
+      std::ofstream out(output_dir_ / "camera_info.txt", std::ios::out);
+      out << std::setprecision(17);
+      out << "width=" << geometry.width << "\n";
+      out << "height=" << geometry.height << "\n";
+      out << "step=" << geometry.step << "\n";
+      out << "encoding=" << static_cast<int>(frame_layout.encoding) << "\n";
+      WriteArrayLine(out, "camera_matrix", FrameCameraMatrix(geometry));
+      WriteArrayLine(out, "distortion_coefficients",
+                     calibration_.distortion_coefficients);
+    }
+    frame_geometry_snapshot_written_ = true;
   }
 
   /**
@@ -839,18 +938,20 @@ class VisionCapture : public LibXR::Application
 
     std::ostringstream marker;
     marker << std::setprecision(10) << cfg_.camera_calibration.marker_size_mm;
-    const bool started = camera_calibration_.Start(
-        marker.str(), cfg_.camera_calibration.cols,
-        cfg_.camera_calibration.rows, session_name_);
+    const bool started =
+        camera_calibration_.Start(marker.str(), cfg_.camera_calibration.cols,
+                                  cfg_.camera_calibration.rows, session_name_);
     if (!started)
     {
       XR_LOG_ERROR("VisionCapture camera calibration failed to start");
       return;
     }
-    XR_LOG_INFO("VisionCapture camera calibration enabled: marker=%.3fmm board=%dx%d auto_save_views=%u",
-                static_cast<float>(cfg_.camera_calibration.marker_size_mm),
-                cfg_.camera_calibration.cols, cfg_.camera_calibration.rows,
-                static_cast<unsigned>(cfg_.camera_calibration.auto_save_views));
+    XR_LOG_INFO(
+        "VisionCapture camera calibration enabled: marker=%.3fmm board=%dx%d "
+        "auto_save_views=%u",
+        static_cast<float>(cfg_.camera_calibration.marker_size_mm),
+        cfg_.camera_calibration.cols, cfg_.camera_calibration.rows,
+        static_cast<unsigned>(cfg_.camera_calibration.auto_save_views));
   }
 
   /**
@@ -862,10 +963,8 @@ class VisionCapture : public LibXR::Application
     {
       return true;
     }
-    const uint64_t min_period_us =
-        static_cast<uint64_t>(1000000.0 / cfg_.record.max_fps);
-    if (last_saved_timestamp_us_ != 0 &&
-        timestamp_us > last_saved_timestamp_us_ &&
+    const uint64_t min_period_us = static_cast<uint64_t>(1000000.0 / cfg_.record.max_fps);
+    if (last_saved_timestamp_us_ != 0 && timestamp_us > last_saved_timestamp_us_ &&
         timestamp_us - last_saved_timestamp_us_ < min_period_us)
     {
       return false;
@@ -885,6 +984,18 @@ class VisionCapture : public LibXR::Application
     }
     frames_seen_.fetch_add(1);
 
+    if (!CameraTypes::ValidateFrameGeometry(frame_layout, calibration_,
+                                            image_frame->geometry))
+    {
+      if (!invalid_geometry_logged_)
+      {
+        invalid_geometry_logged_ = true;
+        XR_LOG_ERROR("VisionCapture rejected invalid FrameGeometry");
+      }
+      return;
+    }
+    WriteFrameGeometrySnapshot(image_frame->geometry);
+
     const uint64_t image_ts = static_cast<uint64_t>(image_frame->timestamp_us);
     const uint64_t imu_ts = static_cast<uint64_t>(frame.imu.timestamp_us);
     const uint64_t dt_us = image_ts > imu_ts ? image_ts - imu_ts : imu_ts - image_ts;
@@ -893,27 +1004,27 @@ class VisionCapture : public LibXR::Application
       return;
     }
 
-    const cv::Mat image =
-        VisionCaptureDetail::MakeImageView<CameraInfoV>(*image_frame);
+    const cv::Mat image = VisionCaptureDetail::MakeImageView<FrameLayoutV>(*image_frame);
     if (image.empty())
     {
       if (!unsupported_encoding_logged_)
       {
         unsupported_encoding_logged_ = true;
         XR_LOG_ERROR("VisionCapture unsupported image encoding=%u",
-                     static_cast<unsigned>(CameraInfoV.encoding));
+                     static_cast<unsigned>(FrameLayoutV.encoding));
       }
       return;
     }
 
-    BoardObservation detection = DetectBoard(image);
+    BoardObservation detection = DetectBoard(image, image_frame->geometry);
     if (detection.observed)
     {
       boards_detected_.fetch_add(1);
     }
-    SamplingDecision sampling = EvaluateCalibrationSampling(detection, frame.imu, dt_us);
+    SamplingDecision sampling =
+        EvaluateCalibrationSampling(detection, image_frame->geometry, frame.imu, dt_us);
     SubmitPreview(image, detection);
-    ProcessCameraCalibration(image, image_ts, sampling.accepted);
+    ProcessCameraCalibration(image, image_frame->geometry, image_ts, sampling.accepted);
 
     if (!ShouldSaveFrames())
     {
@@ -936,8 +1047,8 @@ class VisionCapture : public LibXR::Application
     ++total_saved_frames_;
     last_saved_timestamp_us_ = image_ts;
     const std::string image_path = SaveImage(image, total_saved_frames_);
-    WriteMetadata(total_saved_frames_, image_ts, imu_ts, dt_us, frame.imu,
-                  image_path, detection, sampling);
+    WriteMetadata(total_saved_frames_, image_ts, imu_ts, dt_us, frame.imu, image_path,
+                  detection, sampling);
     frames_saved_.fetch_add(1);
   }
 
@@ -970,17 +1081,16 @@ class VisionCapture : public LibXR::Application
   /**
    * @brief 将通过判稳的标定样本交给相机内参标定器。
    */
-  void ProcessCameraCalibration(const cv::Mat& image, uint64_t image_ts,
-                                bool sample_accepted)
+  void ProcessCameraCalibration(const cv::Mat& image, const FrameGeometry& geometry,
+                                uint64_t image_ts, bool sample_accepted)
   {
     if (!ShouldRunCameraCalibration() || !sample_accepted)
     {
       return;
     }
-    camera_calibration_.ProcessFrame(image.data, image_ts);
+    camera_calibration_.ProcessFrame(image.data, geometry, image_ts);
     if (cfg_.camera_calibration.auto_save_views != 0 &&
-        camera_calibration_.SaveAndStopIfReady(
-            cfg_.camera_calibration.auto_save_views))
+        camera_calibration_.SaveAndStopIfReady(cfg_.camera_calibration.auto_save_views))
     {
       XR_LOG_PASS("VisionCapture camera calibration auto-saved");
     }
@@ -1046,7 +1156,7 @@ class VisionCapture : public LibXR::Application
   /**
    * @brief 检测当前图像中的标定板。
    */
-  BoardObservation DetectBoard(const cv::Mat& image)
+  BoardObservation DetectBoard(const cv::Mat& image, const FrameGeometry& geometry)
   {
     BoardObservation detection;
     if (cfg_.board.type != "aruco")
@@ -1071,14 +1181,12 @@ class VisionCapture : public LibXR::Application
         detection.marker_ids_vec.push_back(ids.at<int>(i, 0));
       }
       const auto board = SamplingBoard();
-      VisionCaptureCalibrationBoard::CollectBoardPoints(detection.marker_corners,
-                                             detection.marker_ids, board,
-                                             detection);
-      detection.homography_rms =
-          VisionCaptureCalibrationBoard::HomographyRms(detection.object_points,
-                                            detection.image_points);
-      VisionCaptureCalibrationBoard::FillQuality(image, CameraInfoV.width, CameraInfoV.height,
-                                      detection);
+      VisionCaptureCalibrationBoard::CollectBoardPoints(
+          detection.marker_corners, detection.marker_ids, board, detection);
+      detection.homography_rms = VisionCaptureCalibrationBoard::HomographyRms(
+          detection.object_points, detection.image_points);
+      VisionCaptureCalibrationBoard::FillQuality(image, geometry.width, geometry.height,
+                                                 detection);
     }
     return detection;
   }
@@ -1118,35 +1226,64 @@ class VisionCapture : public LibXR::Application
   }
 
   /**
-   * @brief 根据 CameraInfoV 构造 OpenCV 相机内参矩阵。
+   * @brief 根据原生相机标定构造 OpenCV 相机内参矩阵。
    */
   cv::Mat CameraMatrix() const
   {
-    return (cv::Mat_<double>(3, 3) << CameraInfoV.camera_matrix[0],
-            CameraInfoV.camera_matrix[1], CameraInfoV.camera_matrix[2],
-            CameraInfoV.camera_matrix[3], CameraInfoV.camera_matrix[4],
-            CameraInfoV.camera_matrix[5], CameraInfoV.camera_matrix[6],
-            CameraInfoV.camera_matrix[7], CameraInfoV.camera_matrix[8]);
+    return (cv::Mat_<double>(3, 3) << calibration_.camera_matrix[0],
+            calibration_.camera_matrix[1], calibration_.camera_matrix[2],
+            calibration_.camera_matrix[3], calibration_.camera_matrix[4],
+            calibration_.camera_matrix[5], calibration_.camera_matrix[6],
+            calibration_.camera_matrix[7], calibration_.camera_matrix[8]);
   }
 
   /**
-   * @brief 根据 CameraInfoV 构造 OpenCV 畸变系数矩阵。
+   * @brief 根据原生相机标定构造 OpenCV PnP 畸变系数矩阵。
    */
   cv::Mat DistortionCoefficients() const
   {
-    cv::Mat distortion(1, static_cast<int>(CameraInfoV.distortion_coefficients.size()),
-                       CV_64F);
-    for (int i = 0; i < distortion.cols; ++i)
+    const auto coeffs = CameraTypes::BuildPnPDistCoeffs(calibration_);
+    if (coeffs.size == 0)
     {
-      distortion.at<double>(0, i) = CameraInfoV.distortion_coefficients[i];
+      return {};
+    }
+    cv::Mat distortion(1, static_cast<int>(coeffs.size), CV_64F);
+    for (int i = 0; i < static_cast<int>(coeffs.size); ++i)
+    {
+      distortion.at<double>(0, i) = coeffs.values[static_cast<std::size_t>(i)];
     }
     return distortion;
   }
 
   /**
+   * @brief 将原生坐标重投影误差换回当前帧像素，保持采样阈值语义。
+   */
+  static double FrameReprojectionRms(const BoardObservation& detection,
+                                     const std::vector<cv::Point2f>& projected_native,
+                                     const FrameGeometry& geometry)
+  {
+    if (projected_native.size() != detection.image_points.size())
+    {
+      return std::numeric_limits<double>::infinity();
+    }
+
+    double sum2 = 0.0;
+    for (std::size_t i = 0; i < projected_native.size(); ++i)
+    {
+      const auto frame_point =
+          CameraTypes::NativeToFrame(geometry, static_cast<double>(projected_native[i].x),
+                                     static_cast<double>(projected_native[i].y));
+      const double dx = frame_point[0] - detection.image_points[i].x;
+      const double dy = frame_point[1] - detection.image_points[i].y;
+      sum2 += dx * dx + dy * dy;
+    }
+    return std::sqrt(sum2 / std::max<std::size_t>(1, projected_native.size()));
+  }
+
+  /**
    * @brief 对当前标定板观测执行 PnP 并写入采样判定。
    */
-  bool SolveMarkerPnp(const BoardObservation& detection,
+  bool SolveMarkerPnp(const BoardObservation& detection, const FrameGeometry& geometry,
                       SamplingDecision& decision) const
   {
     if (!detection.observed)
@@ -1154,20 +1291,36 @@ class VisionCapture : public LibXR::Application
       decision.reason = "board_not_detected";
       return false;
     }
+    if (CameraTypes::BuildPnPDistCoeffs(calibration_).requires_undistort_first)
+    {
+      decision.reason = "distortion_model_unsupported";
+      return false;
+    }
     try
     {
-      const int method = detection.object_points.size() == 4
-                             ? cv::SOLVEPNP_IPPE_SQUARE
-                             : cv::SOLVEPNP_ITERATIVE;
-      const auto pose =
-          VisionCaptureCalibrationBoard::EstimatePose(detection, CameraMatrix(),
-                                       DistortionCoefficients(), method);
+      BoardObservation native_detection = detection;
+      for (auto& point : native_detection.image_points)
+      {
+        const auto native = CameraTypes::FrameToNative(
+            geometry, static_cast<double>(point.x), static_cast<double>(point.y));
+        point.x = static_cast<float>(native[0]);
+        point.y = static_cast<float>(native[1]);
+      }
+      const int method = detection.object_points.size() == 4 ? cv::SOLVEPNP_IPPE_SQUARE
+                                                             : cv::SOLVEPNP_ITERATIVE;
+      const cv::Mat camera_matrix = CameraMatrix();
+      const cv::Mat distortion = DistortionCoefficients();
+      const auto pose = VisionCaptureCalibrationBoard::EstimatePose(
+          native_detection, camera_matrix, distortion, method);
       if (!pose.ok)
       {
         decision.reason = "pnp_failed";
         return false;
       }
-      decision.pnp_rms_px = pose.reprojection_rms_px;
+      std::vector<cv::Point2f> projected_native;
+      cv::projectPoints(detection.object_points, pose.rvec, pose.tvec, camera_matrix,
+                        distortion, projected_native);
+      decision.pnp_rms_px = FrameReprojectionRms(detection, projected_native, geometry);
       decision.rvec = pose.rvec;
       decision.tvec = pose.tvec;
     }
@@ -1189,8 +1342,8 @@ class VisionCapture : public LibXR::Application
    * @brief 对一帧图像和 IMU 执行判稳采样。
    */
   SamplingDecision EvaluateCalibrationSampling(const BoardObservation& detection,
-                                               const ImuStamped& imu,
-                                               uint64_t dt_us)
+                                               const FrameGeometry& geometry,
+                                               const ImuStamped& imu, uint64_t dt_us)
   {
     SamplingDecision decision;
     if (!IsCalibrationDatasetMode() || !cfg_.calibration_sampling.enabled)
@@ -1214,7 +1367,7 @@ class VisionCapture : public LibXR::Application
       SetLastSamplingStatus(decision);
       return decision;
     }
-    if (!SolveMarkerPnp(detection, decision))
+    if (!SolveMarkerPnp(detection, geometry, decision))
     {
       sampling_rejected_.fetch_add(1);
       SetLastSamplingStatus(decision);
@@ -1231,10 +1384,10 @@ class VisionCapture : public LibXR::Application
     sample.acc = VisionCaptureDetail::ToVec3d(imu.linear_acceleration_xyz);
     decision.gyro_norm_dps = VisionCaptureDetail::RadToDeg(cv::norm(sample.gyro));
     decision.acc_norm_mps2 = cv::norm(sample.acc);
-    decision.acc_norm_error_mps2 =
-        std::fabs(decision.acc_norm_mps2 - kGravityMps2);
+    decision.acc_norm_error_mps2 = std::fabs(decision.acc_norm_mps2 - kGravityMps2);
 
-    const bool force_snapshot = force_snapshot_.exchange(false, std::memory_order_acq_rel);
+    const bool force_snapshot =
+        force_snapshot_.exchange(false, std::memory_order_acq_rel);
     {
       std::lock_guard<std::mutex> lock(sampling_mutex_);
       stability_window_.push_back(sample);
@@ -1252,24 +1405,21 @@ class VisionCapture : public LibXR::Application
 
       ComputeWindowStabilityLocked(sample, decision);
     }
-    if (decision.pnp_t_jitter_m >
-        cfg_.calibration_sampling.max_pnp_translation_jitter_m)
+    if (decision.pnp_t_jitter_m > cfg_.calibration_sampling.max_pnp_translation_jitter_m)
     {
       decision.reason = "pnp_translation_unstable";
       sampling_rejected_.fetch_add(1);
       SetLastSamplingStatus(decision);
       return decision;
     }
-    if (decision.pnp_r_jitter_deg >
-        cfg_.calibration_sampling.max_pnp_rotation_jitter_deg)
+    if (decision.pnp_r_jitter_deg > cfg_.calibration_sampling.max_pnp_rotation_jitter_deg)
     {
       decision.reason = "pnp_rotation_unstable";
       sampling_rejected_.fetch_add(1);
       SetLastSamplingStatus(decision);
       return decision;
     }
-    if (decision.imu_r_jitter_deg >
-        cfg_.calibration_sampling.max_imu_rotation_jitter_deg)
+    if (decision.imu_r_jitter_deg > cfg_.calibration_sampling.max_imu_rotation_jitter_deg)
     {
       decision.reason = "imu_rotation_unstable";
       sampling_rejected_.fetch_add(1);
@@ -1283,8 +1433,7 @@ class VisionCapture : public LibXR::Application
       SetLastSamplingStatus(decision);
       return decision;
     }
-    if (decision.acc_norm_error_mps2 >
-        cfg_.calibration_sampling.max_acc_norm_error_mps2)
+    if (decision.acc_norm_error_mps2 > cfg_.calibration_sampling.max_acc_norm_error_mps2)
     {
       decision.reason = "acc_not_gravity";
       sampling_rejected_.fetch_add(1);
@@ -1350,14 +1499,12 @@ class VisionCapture : public LibXR::Application
     cv::Vec3d acc_dir_sum{};
     for (const StableSample& sample : stability_window_)
     {
-      translation_max =
-          std::max(translation_max, cv::norm(sample.tvec - reference.tvec));
-      rotation_max = std::max(rotation_max,
-                              VisionCaptureDetail::RotationDistanceDeg(
-                                  sample.rvec, reference.rvec));
-      imu_rotation_max =
-          std::max(imu_rotation_max, VisionCaptureDetail::QuatAngularDistanceDeg(
-                                         sample.quat, reference.quat));
+      translation_max = std::max(translation_max, cv::norm(sample.tvec - reference.tvec));
+      rotation_max = std::max(rotation_max, VisionCaptureDetail::RotationDistanceDeg(
+                                                sample.rvec, reference.rvec));
+      imu_rotation_max = std::max(
+          imu_rotation_max,
+          VisionCaptureDetail::QuatAngularDistanceDeg(sample.quat, reference.quat));
       const double acc_norm = cv::norm(sample.acc);
       acc_norm_sum += acc_norm;
       acc_norm_sum2 += acc_norm * acc_norm;
@@ -1384,10 +1531,10 @@ class VisionCapture : public LibXR::Application
         continue;
       }
       const cv::Vec3d dir = sample.acc * (1.0 / acc_norm);
-      acc_dir_max = std::max(
-          acc_dir_max,
-          VisionCaptureDetail::RadToDeg(std::acos(
-              VisionCaptureCalibrationBoard::ClampUnit(dir.dot(acc_dir_mean)))));
+      acc_dir_max =
+          std::max(acc_dir_max,
+                   VisionCaptureDetail::RadToDeg(std::acos(
+                       VisionCaptureCalibrationBoard::ClampUnit(dir.dot(acc_dir_mean)))));
     }
     decision.pnp_t_jitter_m = translation_max;
     decision.pnp_r_jitter_deg = rotation_max;
@@ -1406,8 +1553,7 @@ class VisionCapture : public LibXR::Application
       const double translation_delta = cv::norm(sample.tvec - accepted.tvec);
       const double rotation_delta =
           VisionCaptureDetail::RotationDistanceDeg(sample.rvec, accepted.rvec);
-      if (translation_delta <
-              cfg_.calibration_sampling.min_sample_translation_delta_m &&
+      if (translation_delta < cfg_.calibration_sampling.min_sample_translation_delta_m &&
           rotation_delta < cfg_.calibration_sampling.min_sample_rotation_delta_deg)
       {
         return true;
@@ -1448,8 +1594,7 @@ class VisionCapture : public LibXR::Application
                     {
                       if (detection.observed)
                       {
-                        cv::aruco::drawDetectedMarkers(frame,
-                                                       detection.marker_corners,
+                        cv::aruco::drawDetectedMarkers(frame, detection.marker_corners,
                                                        detection.marker_ids);
                       }
                     });
@@ -1493,20 +1638,18 @@ class VisionCapture : public LibXR::Application
    * @brief 写入一行同步帧和采样状态元数据。
    */
   void WriteMetadata(uint64_t frame_id, uint64_t image_ts, uint64_t imu_ts,
-                     uint64_t dt_us, const ImuStamped& imu,
-                     const std::string& image_path, const BoardObservation& detection,
-                     const SamplingDecision& sampling)
+                     uint64_t dt_us, const ImuStamped& imu, const std::string& image_path,
+                     const BoardObservation& detection, const SamplingDecision& sampling)
   {
     if (!metadata_csv_.is_open())
     {
       return;
     }
-    metadata_csv_ << frame_id << "," << image_ts << "," << imu_ts << ","
-                  << dt_us << "," << imu.rotation_wxyz[0] << ","
-                  << imu.rotation_wxyz[1] << "," << imu.rotation_wxyz[2] << ","
-                  << imu.rotation_wxyz[3] << "," << imu.angular_velocity_xyz[0]
-                  << "," << imu.angular_velocity_xyz[1] << ","
-                  << imu.angular_velocity_xyz[2] << ","
+    metadata_csv_ << frame_id << "," << image_ts << "," << imu_ts << "," << dt_us << ","
+                  << imu.rotation_wxyz[0] << "," << imu.rotation_wxyz[1] << ","
+                  << imu.rotation_wxyz[2] << "," << imu.rotation_wxyz[3] << ","
+                  << imu.angular_velocity_xyz[0] << "," << imu.angular_velocity_xyz[1]
+                  << "," << imu.angular_velocity_xyz[2] << ","
                   << imu.linear_acceleration_xyz[0] << ","
                   << imu.linear_acceleration_xyz[1] << ","
                   << imu.linear_acceleration_xyz[2] << "," << image_path << ","
@@ -1514,14 +1657,12 @@ class VisionCapture : public LibXR::Application
                   << detection.marker_ids_vec.size() << ","
                   << JoinIds(detection.marker_ids_vec) << ","
                   << (sampling.accepted ? 1 : 0) << "," << sampling.reason << ","
-                  << (sampling.pnp_ok ? 1 : 0) << "," << sampling.pnp_rms_px
-                  << "," << sampling.pnp_t_jitter_m << ","
-                  << sampling.pnp_r_jitter_deg << ","
-                  << sampling.imu_r_jitter_deg << ","
-                  << sampling.gyro_norm_dps << "," << sampling.acc_norm_mps2
-                  << "," << sampling.acc_norm_error_mps2 << ","
-                  << sampling.acc_norm_jitter_mps2 << ","
-                  << sampling.acc_dir_jitter_deg << "\n";
+                  << (sampling.pnp_ok ? 1 : 0) << "," << sampling.pnp_rms_px << ","
+                  << sampling.pnp_t_jitter_m << "," << sampling.pnp_r_jitter_deg << ","
+                  << sampling.imu_r_jitter_deg << "," << sampling.gyro_norm_dps << ","
+                  << sampling.acc_norm_mps2 << "," << sampling.acc_norm_error_mps2 << ","
+                  << sampling.acc_norm_jitter_mps2 << "," << sampling.acc_dir_jitter_deg
+                  << "\n";
     metadata_csv_.flush();
   }
 
@@ -1530,6 +1671,8 @@ class VisionCapture : public LibXR::Application
   Config cfg_{};
   /// 同步帧来源。
   Sync* sync_{nullptr};
+  /// 构造时从 CameraFrameSync 复制的原生相机标定。
+  const CameraCalibration calibration_;
   /// 可选预览输出。
   VisionPreview preview_{};
   /// 同步帧消费线程。
@@ -1545,7 +1688,7 @@ class VisionCapture : public LibXR::Application
   /// OpenCV ArUco 检测参数。
   cv::aruco::DetectorParameters detector_params_{};
   /// 相机内参标定流程对象。
-  VisionCaptureCameraCalibration<CameraInfoV> camera_calibration_{};
+  VisionCaptureCameraCalibration<FrameLayoutV> camera_calibration_;
 
   /// 标准重力加速度，单位 m/s^2。
   static constexpr double kGravityMps2 = 9.80665;
@@ -1587,6 +1730,10 @@ class VisionCapture : public LibXR::Application
   uint64_t last_saved_timestamp_us_{0};
   /// 是否已经打印过不支持图像编码错误。
   bool unsupported_encoding_logged_{false};
+  /// 是否已经打印过非法 geometry 错误。
+  bool invalid_geometry_logged_{false};
+  /// 首帧 geometry 和兼容 camera_info 快照是否已经写出。
+  bool frame_geometry_snapshot_written_{false};
 
   /// monitor 周期内看到的同步帧数。
   std::atomic<uint64_t> frames_seen_{0};
