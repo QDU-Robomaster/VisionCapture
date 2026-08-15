@@ -4,10 +4,12 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -27,6 +29,9 @@
 #include "CameraBaseIntrinsicSanity.hpp"
 #include "VisionCaptureCalibrationBoard.hpp"
 #include "VisionCaptureCalibrationGeometry.hpp"
+#include "VisionCaptureCalibrationQuality.hpp"
+#include "VisionCaptureRecording.hpp"
+#include "VisionCaptureSampling.hpp"
 #include "logger.hpp"
 
 /**
@@ -69,7 +74,7 @@ class VisionCaptureCameraCalibration
   explicit VisionCaptureCameraCalibration(CameraCalibration calibration)
       : calibration_(calibration)
   {
-    ASSERT(CameraBaseIntrinsicSanity::CameraCalibrationReasonable(calibration_));
+    ASSERT(VisionCaptureSampling::NativeSensorSizeUsable(calibration_));
   }
 
   /**
@@ -91,13 +96,13 @@ class VisionCaptureCameraCalibration
     /// 建议采满的视角数；达到后提示操作手可以保存。
     int recommended_views = default_recommended_views;
     /// 图像处理抽帧间隔；所有帧仍被吞掉，但只每 N 帧跑一次检测。
-    int process_stride = 3;
+    int process_stride = 1;
     /// 两个已接受视角之间的最小时间间隔，避免一段静止画面刷满样本。
     uint64_t min_accept_interval_us = 200000;
     /// 单应性重投影 RMS 上限，用于早期剔除明显错检或严重畸变视角。
     double max_homography_rms = 2.5;
-    /// 标定后单视角重投影 RMS 上限，单位为当前 FrameLayout 的帧像素。
-    double max_reprojection_rms = 3.0;
+    /// 可交付结果的视角、重投影和覆盖范围门限。
+    VisionCaptureCalibrationQuality::Limits quality_limits{};
     /// marker 区域拉普拉斯方差绝对下限，用于拒绝明显运动模糊。
     double min_sharpness_score = 30.0;
     /// 相对本轮最佳清晰度的下限比例，适配不同相机曝光和画面尺度。
@@ -144,6 +149,11 @@ class VisionCaptureCameraCalibration
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    if (solving_)
+    {
+      XR_LOG_WARN("camera calibration: cannot restart while solve is active");
+      return false;
+    }
     // Start() 持有锁后一次性替换本轮配置，避免采样线程看到半初始化状态。
     config_ = MakeConfig(marker_mm, cols, rows);
     board_ = MakeGShangMarkerMap(config_);
@@ -263,32 +273,91 @@ class VisionCaptureCameraCalibration
     std::vector<View> views;
     Config config;
     std::string output_dir;
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      // 保存命令会结束本次标定。即使数值求解失败，也恢复图像发布，
-      // 操作手可以调整姿态后重新开始一轮。
-      active_ = false;
-      active_fast_.store(false, std::memory_order_release);
-      // 复制视角和配置后释放锁，避免耗时的 calibrateCamera 阻塞采样入口。
-      views = accepted_views_;
-      config = config_;
-      output_dir = output_dir_;
-    }
-
     CalibrationOutput output;
-    if (!CalibrateAndWrite(views, config, output_dir, calibration_, output))
+    bool calibration_ok = false;
+    bool solve_claimed = false;
+    try
+    {
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true)
+        {
+          const auto action = VisionCaptureCalibrationQuality::DecideSolveClaim(
+              active_, finished_, solving_);
+          if (action == VisionCaptureCalibrationQuality::SolveClaimAction::WAIT)
+          {
+            solve_cv_.wait(lock, [this] { return !solving_; });
+            continue;
+          }
+          if (action == VisionCaptureCalibrationQuality::SolveClaimAction::RETURN_SUCCESS)
+          {
+            return true;
+          }
+          if (action == VisionCaptureCalibrationQuality::SolveClaimAction::RETURN_FAILURE)
+          {
+            return false;
+          }
+          solving_ = true;
+          solve_claimed = true;
+          break;
+        }
+        // 保存命令会结束本次标定。即使数值求解失败，也恢复图像发布，
+        // 操作手可以调整姿态后重新开始一轮。
+        active_ = false;
+        active_fast_.store(false, std::memory_order_release);
+        // 复制视角和配置后释放锁，避免耗时的 calibrateCamera 阻塞采样入口。
+        views = accepted_views_;
+        config = config_;
+        output_dir = output_dir_;
+      }
+      calibration_ok = CalibrateAndWrite(views, config, output_dir, calibration_, output);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (calibration_ok)
+        {
+          last_saved_yaml_ = output.yaml_path;
+          last_rms_ = output.rms;
+          finished_ = true;
+        }
+        solving_ = false;
+      }
+      solve_claimed = false;
+      solve_cv_.notify_all();
+    }
+    catch (const std::exception& e)
+    {
+      if (solve_claimed)
+      {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          solving_ = false;
+        }
+        solve_cv_.notify_all();
+      }
+      XR_LOG_ERROR("camera calibration: unexpected solve failure: %s", e.what());
+      return false;
+    }
+    catch (...)
+    {
+      if (solve_claimed)
+      {
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          solving_ = false;
+        }
+        solve_cv_.notify_all();
+      }
+      XR_LOG_ERROR("camera calibration: unexpected non-standard solve failure");
+      return false;
+    }
+    if (!output.quality_report_text.empty())
+    {
+      PrintQualityReport(output.quality_report_text);
+    }
+    if (!calibration_ok)
     {
       return false;
     }
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      finished_ = true;
-      last_rms_ = output.rms;
-      last_saved_yaml_ = output.yaml_path;
-    }
-    PrintQualityReport(output.quality_report_text);
     PrintXRobotYamlSnippet(output.xrobot_yaml_snippet);
     return true;
   }
@@ -344,7 +413,7 @@ class VisionCaptureCameraCalibration
   {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (finished_ || !active_ || accepted_views_.size() < target_views)
+      if (finished_ || solving_ || !active_ || accepted_views_.size() < target_views)
       {
         return false;
       }
@@ -601,7 +670,8 @@ class VisionCaptureCameraCalibration
 
     // 单应性 RMS 是快速几何门槛，能在 calibrateCamera 前拒绝明显错配的角点集。
     observation.homography_rms = VisionCaptureCalibrationBoard::HomographyRms(
-        observation.object_points, observation.image_points);
+        observation.object_points, observation.image_points,
+        &observation.homography_projected_points);
     if (observation.used_markers < RequiredMarkerCount(snapshot.config) ||
         observation.homography_rms > snapshot.config.max_homography_rms)
     {
@@ -1106,37 +1176,45 @@ class VisionCaptureCameraCalibration
   static std::string MakeQualityReportText(
       const std::vector<View>& views, const std::vector<double>& per_view_rms,
       const CameraBaseIntrinsicSanity::Metrics& intrinsics, double global_frame_rms,
-      double global_native_rms, double max_reprojection_rms)
+      double global_native_rms, const VisionCaptureCalibrationQuality::Limits& limits,
+      const VisionCaptureCalibrationQuality::Result& quality)
   {
     const CoverageMetrics coverage = ComputeCoverage(views);
     const double per_view_p50 = Percentile(per_view_rms, 0.50);
     const double per_view_p95 = Percentile(per_view_rms, 0.95);
-    const double per_view_max = Percentile(per_view_rms, 1.00);
-    const bool reprojection_ok = global_frame_rms >= 0.0 &&
-                                 global_frame_rms <= max_reprojection_rms &&
-                                 per_view_max <= max_reprojection_rms;
-    const bool quality_ok = intrinsics.all_ok && reprojection_ok;
 
     std::ostringstream out;
     out << std::setprecision(10);
     out << "===== 标定质量报告开始 =====\n";
-    out << "质量总判定(quality_ok): " << CameraBaseIntrinsicSanity::PassFail(quality_ok)
-        << "\n";
+    out << "质量总判定(quality_ok): "
+        << CameraBaseIntrinsicSanity::PassFail(quality.quality_ok) << "\n";
     out << "最终视角数(views): " << coverage.views << "\n";
+    out << "最少视角数(minimum_views): " << limits.minimum_views << "\n";
+    out << "视角数判定(views_ok): "
+        << CameraBaseIntrinsicSanity::PassFail(quality.views_ok) << "\n";
     out << "重投影判定(reprojection_ok): "
-        << CameraBaseIntrinsicSanity::PassFail(reprojection_ok) << "\n";
-    out << "重投影阈值(max_reprojection_rms): " << max_reprojection_rms << " frame_px\n";
+        << CameraBaseIntrinsicSanity::PassFail(quality.reprojection_ok) << "\n";
+    out << "覆盖判定(coverage_ok): "
+        << CameraBaseIntrinsicSanity::PassFail(quality.coverage_ok) << "\n";
+    out << "全局重投影阈值(max_global_reprojection_rms): "
+        << limits.max_global_reprojection_rms << " frame_px\n";
+    out << "单视角重投影阈值(max_per_view_reprojection_rms): "
+        << limits.max_per_view_reprojection_rms << " frame_px\n";
     out << "全局重投影 RMS(global_frame_rms): " << global_frame_rms << " frame_px\n";
     out << "OpenCV 原生 RMS(global_native_rms): " << global_native_rms << " native_px\n";
     out << "单视角重投影 RMS P50(per_view_rms_p50): " << per_view_p50 << " frame_px\n";
     out << "单视角重投影 RMS P95(per_view_rms_p95): " << per_view_p95 << " frame_px\n";
-    out << "单视角重投影 RMS 最大值(per_view_rms_max): " << per_view_max << " frame_px\n";
+    out << "单视角重投影 RMS 最大值(per_view_rms_max): " << quality.per_view_max
+        << " frame_px\n";
     out << "样本中心 X 覆盖(coverage_center_x): [" << coverage.center_x_min << ", "
         << coverage.center_x_max << "] span=" << coverage.center_span_x << "\n";
+    out << "样本中心 X 最小跨度(min_center_span_x): " << limits.min_center_span_x << "\n";
     out << "样本中心 Y 覆盖(coverage_center_y): [" << coverage.center_y_min << ", "
         << coverage.center_y_max << "] span=" << coverage.center_span_y << "\n";
+    out << "样本中心 Y 最小跨度(min_center_span_y): " << limits.min_center_span_y << "\n";
     out << "样本尺度覆盖(coverage_scale): [" << coverage.scale_min << ", "
         << coverage.scale_max << "] ratio=" << coverage.scale_ratio << "\n";
+    out << "样本尺度最小比例(min_scale_ratio): " << limits.min_scale_ratio << "\n";
     out << "样本平面角覆盖(coverage_angle_deg): [" << coverage.angle_min_deg << ", "
         << coverage.angle_max_deg << "] span=" << coverage.angle_span_deg << "\n";
     out << CameraBaseIntrinsicSanity::FormatReport(intrinsics);
@@ -1165,11 +1243,15 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 写出标定质量报告。
    */
-  static std::string WriteQualityReport(
-      const std::filesystem::path& path, const std::vector<View>& views,
-      const std::vector<double>& per_view_rms, const cv::Mat& camera_matrix,
-      const cv::Mat& distortion, const CameraCalibration& calibration,
-      double global_frame_rms, double global_native_rms, double max_reprojection_rms)
+  static bool WriteQualityReport(const std::filesystem::path& path,
+                                 const std::vector<View>& views,
+                                 const std::vector<double>& per_view_rms,
+                                 const cv::Mat& camera_matrix, const cv::Mat& distortion,
+                                 const CameraCalibration& calibration,
+                                 double global_frame_rms, double global_native_rms,
+                                 const VisionCaptureCalibrationQuality::Limits& limits,
+                                 VisionCaptureCalibrationQuality::Result& quality,
+                                 std::string& report)
   {
     const std::array<double, 9> camera_values = CameraMatrixValues(camera_matrix);
     const std::array<double, 14> distortion_values = DistortionValues(distortion);
@@ -1178,12 +1260,18 @@ class VisionCaptureCameraCalibration
                                             calibration.native_height, camera_values,
                                             distortion_values);
 
-    const std::string report =
-        MakeQualityReportText(views, per_view_rms, intrinsics, global_frame_rms,
-                              global_native_rms, max_reprojection_rms);
-    std::ofstream out(path);
-    out << report;
-    return report;
+    const CoverageMetrics coverage = ComputeCoverage(views);
+    const VisionCaptureCalibrationQuality::Coverage quality_coverage{
+        .center_span_x = coverage.center_span_x,
+        .center_span_y = coverage.center_span_y,
+        .scale_ratio = coverage.scale_ratio,
+    };
+    quality = VisionCaptureCalibrationQuality::Evaluate(views.size(), intrinsics.all_ok,
+                                                        global_frame_rms, per_view_rms,
+                                                        quality_coverage, limits);
+    report = MakeQualityReportText(views, per_view_rms, intrinsics, global_frame_rms,
+                                   global_native_rms, limits, quality);
+    return VisionCaptureRecording::WriteTextFile(path, report);
   }
 
   /**
@@ -1264,7 +1352,8 @@ class VisionCaptureCameraCalibration
         PerViewRms(calibration_views, camera_matrix, distortion, rvecs, tvecs);
 
     const std::vector<View> filtered =
-        FilterByRms(calibration_views, final_per_view_rms, config.max_reprojection_rms);
+        FilterByRms(calibration_views, final_per_view_rms,
+                    config.quality_limits.max_per_view_reprojection_rms);
     if (filtered.size() >= solver_view_floor &&
         filtered.size() < calibration_views.size())
     {
@@ -1320,22 +1409,55 @@ class VisionCaptureCameraCalibration
         std::filesystem::path(output_dir) / "quality_report.txt";
     const std::filesystem::path snippet_path =
         std::filesystem::path(output_dir) / "camera_info_snippet.txt";
-    const std::string xrobot_yaml_snippet =
-        MakeXRobotCameraCalibrationYaml(camera_matrix, distortion, calibration);
-
-    // 三个输出分别服务于 OpenCV 复用、视角质量复盘、xrobot.yaml 常量粘贴。
-    WriteCalibrationYaml(yaml_path, config, camera_matrix, distortion, calibration,
-                         frame_rms, native_rms, static_cast<int>(final_views.size()));
-    WriteViewsCsv(csv_path, final_views, final_per_view_rms);
-    const std::string quality_report = WriteQualityReport(
-        quality_path, final_views, final_per_view_rms, camera_matrix, distortion,
-        calibration, frame_rms, native_rms, config.max_reprojection_rms);
-    WriteCameraInfoSnippet(snippet_path, xrobot_yaml_snippet);
+    // 视角明细和质量报告始终保留，失败候选也可据此复盘。
+    if (!WriteViewsCsv(csv_path, final_views, final_per_view_rms))
+    {
+      XR_LOG_ERROR("camera calibration: failed to write views CSV: %s",
+                   csv_path.string().c_str());
+      return false;
+    }
+    VisionCaptureCalibrationQuality::Result quality{};
+    std::string quality_report;
+    const bool quality_report_written =
+        WriteQualityReport(quality_path, final_views, final_per_view_rms, camera_matrix,
+                           distortion, calibration, frame_rms, native_rms,
+                           config.quality_limits, quality, quality_report);
 
     output.rms = frame_rms;
-    output.yaml_path = yaml_path.string();
     output.quality_report_path = quality_path.string();
     output.quality_report_text = quality_report;
+    if (!quality_report_written)
+    {
+      XR_LOG_ERROR("camera calibration: failed to write quality report: %s",
+                   quality_path.string().c_str());
+      return false;
+    }
+    if (!quality.quality_ok)
+    {
+      XR_LOG_ERROR(
+          "camera calibration quality gate failed: views=%u rms_frame=%.4f "
+          "quality=%s",
+          static_cast<unsigned>(final_views.size()), static_cast<float>(frame_rms),
+          output.quality_report_path.c_str());
+      return false;
+    }
+
+    const std::string xrobot_yaml_snippet =
+        MakeXRobotCameraCalibrationYaml(camera_matrix, distortion, calibration);
+    if (!WriteCalibrationYaml(yaml_path, config, camera_matrix, distortion, calibration,
+                              frame_rms, native_rms,
+                              static_cast<int>(final_views.size())) ||
+        !WriteCameraInfoSnippet(snippet_path, xrobot_yaml_snippet))
+    {
+      std::error_code cleanup_error;
+      std::filesystem::remove(yaml_path, cleanup_error);
+      cleanup_error.clear();
+      std::filesystem::remove(snippet_path, cleanup_error);
+      XR_LOG_ERROR("camera calibration: failed to persist YAML/snippet in %s",
+                   output_dir.c_str());
+      return false;
+    }
+    output.yaml_path = yaml_path.string();
     output.xrobot_yaml_snippet = xrobot_yaml_snippet;
     XR_LOG_PASS(
         "camera calibration saved: views=%u rms_frame=%.4f rms_native=%.4f "
@@ -1349,27 +1471,41 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 写出 OpenCV FileStorage 格式的完整标定结果。
    */
-  static void WriteCalibrationYaml(const std::filesystem::path& path,
+  static bool WriteCalibrationYaml(const std::filesystem::path& path,
                                    const Config& config, const cv::Mat& camera_matrix,
                                    const cv::Mat& distortion,
                                    const CameraCalibration& calibration, double frame_rms,
                                    double native_rms, int views)
   {
-    cv::FileStorage fs(path.string(), cv::FileStorage::WRITE);
-    fs << "image_width" << static_cast<int>(calibration.native_width);
-    fs << "image_height" << static_cast<int>(calibration.native_height);
-    fs << "rows" << config.rows;
-    fs << "cols" << config.cols;
-    fs << "marker_mm" << config.marker_mm;
-    fs << "square_mm" << SquareMm(config);
-    fs << "dictionary" << "aruco_original";
-    fs << "generator" << "GShang ChArUco: square = marker * 9 / 7";
-    fs << "views" << views;
-    fs << "rms" << frame_rms;
-    fs << "rms_units" << "frame_pixels";
-    fs << "native_rms" << native_rms;
-    fs << "camera_matrix" << camera_matrix;
-    fs << "distortion_coefficients" << distortion;
+    try
+    {
+      cv::FileStorage fs("", cv::FileStorage::WRITE | cv::FileStorage::MEMORY |
+                                 cv::FileStorage::FORMAT_YAML);
+      if (!fs.isOpened())
+      {
+        return false;
+      }
+      fs << "image_width" << static_cast<int>(calibration.native_width);
+      fs << "image_height" << static_cast<int>(calibration.native_height);
+      fs << "rows" << config.rows;
+      fs << "cols" << config.cols;
+      fs << "marker_mm" << config.marker_mm;
+      fs << "square_mm" << SquareMm(config);
+      fs << "dictionary" << "aruco_original";
+      fs << "generator" << "GShang ChArUco: square = marker * 9 / 7";
+      fs << "views" << views;
+      fs << "rms" << frame_rms;
+      fs << "rms_units" << "frame_pixels";
+      fs << "native_rms" << native_rms;
+      fs << "camera_matrix" << camera_matrix;
+      fs << "distortion_coefficients" << distortion;
+      const std::string yaml = fs.releaseAndGetString();
+      return !yaml.empty() && VisionCaptureRecording::WriteTextFile(path, yaml);
+    }
+    catch (const cv::Exception&)
+    {
+      return false;
+    }
   }
 
   /**
@@ -1377,11 +1513,11 @@ class VisionCaptureCameraCalibration
    *
    * CSV 用于离线检查自动采样是否覆盖了足够姿态，以及哪些视角被最终保留。
    */
-  static void WriteViewsCsv(const std::filesystem::path& path,
+  static bool WriteViewsCsv(const std::filesystem::path& path,
                             const std::vector<View>& views,
                             const std::vector<double>& per_view_rms)
   {
-    std::ofstream csv(path);
+    std::ostringstream csv;
     csv << "frame_index,timestamp_us,used_markers,homography_rms,"
            "sharpness_score,center_x_norm,center_y_norm,scale_norm,angle_deg,"
            "per_view_reprojection_rms\n";
@@ -1394,6 +1530,7 @@ class VisionCaptureCameraCalibration
           << views[i].angle_deg << ","
           << (i < per_view_rms.size() ? per_view_rms[i] : -1.0) << "\n";
     }
+    return VisionCaptureRecording::WriteTextFile(path, csv.str());
   }
 
   /**
@@ -1485,11 +1622,10 @@ class VisionCaptureCameraCalibration
   /**
    * @brief 写出可粘贴到 xrobot.yaml 的布局和原生标定片段。
    */
-  static void WriteCameraInfoSnippet(const std::filesystem::path& path,
+  static bool WriteCameraInfoSnippet(const std::filesystem::path& path,
                                      const std::string& xrobot_yaml_snippet)
   {
-    std::ofstream out(path);
-    out << xrobot_yaml_snippet;
+    return VisionCaptureRecording::WriteTextFile(path, xrobot_yaml_snippet);
   }
 
   /**
@@ -1558,6 +1694,8 @@ class VisionCaptureCameraCalibration
   const CameraCalibration calibration_;
   /// 保护配置、采样池、输出路径和统计计数；OpenCV 重活不在锁内执行。
   mutable std::mutex mutex_;
+  /// 等待当前唯一求解者完成，供并发的自动/手动保存复用结果。
+  std::condition_variable solve_cv_;
   /// VisionCapture 处理线程的快速活动标记，用于未激活时无锁直接放行。
   std::atomic<bool> active_fast_{false};
 
@@ -1565,6 +1703,8 @@ class VisionCaptureCameraCalibration
   bool active_{false};
   /// 最近一次 SaveAndStop() 是否成功写出了标定文件。
   bool finished_{false};
+  /// true 表示一个 SaveAndStop() 已取得求解和写盘所有权。
+  bool solving_{false};
   /// 不支持像素编码错误是否已经记录过。
   bool unsupported_encoding_logged_{false};
   /// 达到建议视角数的提示是否已经记录过。

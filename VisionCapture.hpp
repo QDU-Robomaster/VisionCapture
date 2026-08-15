@@ -99,6 +99,8 @@ depends:
 #include "CameraFrameSync.hpp"
 #include "VisionCaptureCalibrationBoard.hpp"
 #include "VisionCaptureCameraCalibration.hpp"
+#include "VisionCaptureRecording.hpp"
+#include "VisionCaptureSampling.hpp"
 #include "VisionPreview.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
@@ -106,12 +108,8 @@ depends:
 
 namespace VisionCaptureDetail
 {
-/// 同步帧消费线程栈大小。
-inline constexpr size_t kWorkerStackSize = 8192;
 /// 标准输入命令线程栈大小。
 inline constexpr size_t kControlStackSize = 4096;
-/// 等待 CameraFrameSync 同步帧的超时时间，单位 ms。
-inline constexpr uint32_t kSyncWaitTimeoutMs = 1000;
 
 /**
  * @brief 将 string_view 复制为拥有存储的 std::string。
@@ -211,6 +209,16 @@ inline cv::Mat MakeBgrForPreview(const cv::Mat& image)
   return bgr;
 }
 
+inline void DrawOutlinedText(cv::Mat& image, std::string_view text, cv::Point origin,
+                             const cv::Scalar& color, double scale = 0.62)
+{
+  const std::string owned(text);
+  cv::putText(image, owned, origin, cv::FONT_HERSHEY_SIMPLEX, scale, {0, 0, 0}, 4,
+              cv::LINE_AA);
+  cv::putText(image, owned, origin, cv::FONT_HERSHEY_SIMPLEX, scale, color, 1,
+              cv::LINE_AA);
+}
+
 /**
  * @brief 弧度转角度。
  */
@@ -298,6 +306,8 @@ class VisionCapture : public LibXR::Application
   using ImuStamped = typename Sync::ImuStamped;
   /// 图像和 IMU 合包类型。
   using SyncedFrame = typename Sync::SyncedFrame;
+  /// 同步帧普通 Topic 的借用 payload。
+  using SyncedFrameTopicPayload = typename Sync::SyncedFrameTopicPayload;
   /// 原生传感器坐标系下的不可变相机标定。
   using CameraCalibration = typename Sync::CameraCalibration;
   /// 单帧到原生传感器坐标系的采样映射。
@@ -325,7 +335,7 @@ class VisionCapture : public LibXR::Application
     bool save_metadata = true;
     /// 是否在 samples.csv 中写入同步 IMU 数据。
     bool save_raw_imu = true;
-    /// CSV 每写入多少行刷盘一次。
+    /// CSV 每写入多少行刷盘一次；0 表示仅在流关闭时刷盘。
     uint32_t flush_every_n = 1;
   };
 
@@ -347,9 +357,9 @@ class VisionCapture : public LibXR::Application
    */
   struct FilterParams
   {
-    /// true 表示没有同步 IMU 的图像不保存。
+    /// 旧 YAML 兼容字段；输入已由 CameraFrameSync 配对，标定模式不读取本字段。
     bool require_synced_imu = true;
-    /// 图像与 IMU 时间戳允许的最大差值，单位 us。
+    /// 旧 YAML 兼容字段；相机和 MCU 时间域不可直接相减，当前实现不使用本字段。
     uint32_t max_image_imu_dt_us = 2000;
   };
 
@@ -507,18 +517,17 @@ class VisionCapture : public LibXR::Application
   };
 
   /**
-   * @brief 构造同步采集模块并启动工作线程。
+   * @brief 构造同步采集模块并订阅同步帧 Topic。
    */
   VisionCapture(LibXR::HardwareContainer&, LibXR::ApplicationManager& app, Config cfg,
                 Sync* sync)
       : cfg_(cfg),
-        sync_(sync),
         calibration_(sync != nullptr ? sync->Calibration() : CameraCalibration{}),
         dictionary_(cv::aruco::getPredefinedDictionary(
             VisionCaptureDetail::ArucoDictionaryId(cfg_.board.dictionary))),
         camera_calibration_(calibration_)
   {
-    ASSERT(sync_ != nullptr);
+    ASSERT(sync != nullptr);
 
     NormalizeCalibrationConfig();
     detector_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
@@ -527,12 +536,15 @@ class VisionCapture : public LibXR::Application
                             std::memory_order_release);
     PrepareOutput();
     StartCameraCalibrationIfNeeded();
-    worker_thread_.Create(this, WorkerThreadFun, "VisionCapture",
-                          VisionCaptureDetail::kWorkerStackSize,
-                          LibXR::Thread::Priority::MEDIUM);
+    synced_frame_topic_ =
+        LibXR::Topic(LibXR::Topic::FindOrCreate<SyncedFrameTopicPayload>(
+            sync->SyncedFrameTopicName()));
+    synced_frame_callback_ = LibXR::Topic::Callback::Create(OnSyncedFrameStatic, this);
+    synced_frame_topic_.RegisterCallback(synced_frame_callback_);
+    XR_LOG_INFO("VisionCapture subscribed: topic=%s", sync->SyncedFrameTopicName());
     if (cfg_.control.stdin_enabled)
     {
-      control_thread_.Create(this, ControlThreadFun, "VisionCaptureCtl",
+      control_thread_.Create(this, ControlThreadFun, "VisionCapCtl",
                              VisionCaptureDetail::kControlStackSize,
                              LibXR::Thread::Priority::LOW);
     }
@@ -568,40 +580,16 @@ class VisionCapture : public LibXR::Application
 
  private:
   /**
-   * @brief 从 CameraFrameSync 阻塞读取同步帧并交给 ProcessFrame()。
+   * @brief 在普通 Topic 同步回调内处理借用的同步帧。
    */
-  static void WorkerThreadFun(VisionCapture* self)
+  static void OnSyncedFrameStatic(bool, VisionCapture* self,
+                                  SyncedFrameTopicPayload borrowed)
   {
-    ASSERT(self->sync_ != nullptr);
-    Sync& sync = *self->sync_;
-
-    XR_LOG_INFO("VisionCapture worker starting: image=%s imu=%s", sync.ImageTopicName(),
-                sync.ImuTopicName());
-
-    typename Sync::Subscriber subscriber(sync);
-    if (!subscriber.Valid())
+    if (borrowed == nullptr || !borrowed->Valid())
     {
-      XR_LOG_ERROR("VisionCapture failed to attach sync stream: image=%s",
-                   sync.ImageTopicName());
       return;
     }
-
-    SyncedFrame frame;
-    while (true)
-    {
-      const auto wait_ans =
-          subscriber.Wait(frame, VisionCaptureDetail::kSyncWaitTimeoutMs);
-      if (wait_ans == LibXR::ErrorCode::TIMEOUT)
-      {
-        continue;
-      }
-      if (wait_ans != LibXR::ErrorCode::OK)
-      {
-        XR_LOG_ERROR("VisionCapture sync wait failed err=%d", static_cast<int>(wait_ans));
-        return;
-      }
-      self->ProcessFrame(frame);
-    }
+    self->ProcessFrame(*borrowed);
   }
 
   /**
@@ -683,7 +671,11 @@ class VisionCapture : public LibXR::Application
     std::lock_guard<std::mutex> lock(sampling_mutex_);
     stability_window_.clear();
     accepted_calibration_samples_.clear();
+    accepted_visual_samples_.clear();
     last_accepted_sample_ = StableSample{};
+    last_intrinsic_accept_timestamp_us_ = 0;
+    best_intrinsic_sharpness_score_ = 0.0;
+    sampling_accepted_total_.store(0, std::memory_order_release);
     {
       std::lock_guard<std::mutex> status_lock(status_mutex_);
       last_reject_reason_ = "reset";
@@ -698,44 +690,39 @@ class VisionCapture : public LibXR::Application
    */
   void SolveCurrentCalibration()
   {
-    bool solved_camera = false;
-    if (ShouldRunCameraCalibration())
+    const auto mode = CurrentDatasetMode();
+    if (mode == VisionCaptureSampling::DatasetMode::INTRINSIC)
     {
       if (camera_calibration_.SaveAndStop())
       {
         XR_LOG_PASS("VisionCapture control: camera calibration solved");
-        solved_camera = true;
       }
       else
       {
         XR_LOG_WARN("VisionCapture control: camera calibration solve failed");
       }
+      return;
     }
 
-    std::size_t samples = 0;
-    {
-      std::lock_guard<std::mutex> lock(sampling_mutex_);
-      samples = accepted_calibration_samples_.size();
-    }
-    if (IsCalibrationDatasetMode())
+    if (mode == VisionCaptureSampling::DatasetMode::HAND_EYE)
     {
       XR_LOG_WARN(
           "VisionCapture control: handeye solver is not implemented yet, "
           "accepted_samples=%u",
-          static_cast<unsigned>(samples));
+          static_cast<unsigned>(
+              sampling_accepted_total_.load(std::memory_order_acquire)));
+      return;
     }
-    else if (!solved_camera)
-    {
-      XR_LOG_WARN("VisionCapture control: no calibration solver active");
-    }
+    XR_LOG_WARN("VisionCapture control: no calibration solver active");
   }
 
   /**
-   * @brief 标定模式固定保存通过判稳的图像和同步 IMU 元数据。
+   * @brief 标定模式固定保存通过判稳的图像和元数据。
    */
   void NormalizeCalibrationConfig()
   {
-    if (!IsCalibrationDatasetMode())
+    const auto mode = CurrentDatasetMode();
+    if (mode == VisionCaptureSampling::DatasetMode::NONE)
     {
       return;
     }
@@ -743,8 +730,21 @@ class VisionCapture : public LibXR::Application
     cfg_.record.max_fps = 0.0;
     cfg_.record.save_images = true;
     cfg_.record.save_metadata = true;
-    cfg_.record.save_raw_imu = true;
-    cfg_.record.flush_every_n = 1;
+    cfg_.record.save_raw_imu =
+        VisionCaptureSampling::ShouldSaveRawImu(mode, cfg_.record.save_raw_imu);
+    if (cfg_.camera_calibration.marker_size_mm !=
+            VisionCaptureSampling::kGShangMarkerSizeMm ||
+        cfg_.camera_calibration.cols != VisionCaptureSampling::kGShangColumns ||
+        cfg_.camera_calibration.rows != VisionCaptureSampling::kGShangRows)
+    {
+      XR_LOG_WARN("VisionCapture calibration board forced to GShang %.0fmm %dx%d",
+                  VisionCaptureSampling::kGShangMarkerSizeMm,
+                  VisionCaptureSampling::kGShangColumns,
+                  VisionCaptureSampling::kGShangRows);
+    }
+    cfg_.camera_calibration.marker_size_mm = VisionCaptureSampling::kGShangMarkerSizeMm;
+    cfg_.camera_calibration.cols = VisionCaptureSampling::kGShangColumns;
+    cfg_.camera_calibration.rows = VisionCaptureSampling::kGShangRows;
   }
 
   /**
@@ -752,16 +752,18 @@ class VisionCapture : public LibXR::Application
    */
   std::string BuildStatusLine() const
   {
-    std::size_t samples = 0;
-    {
-      std::lock_guard<std::mutex> lock(sampling_mutex_);
-      samples = accepted_calibration_samples_.size();
-    }
+    const auto mode = CurrentDatasetMode();
+    const uint64_t samples = sampling_accepted_total_.load(std::memory_order_acquire);
     std::lock_guard<std::mutex> status_lock(status_mutex_);
     std::ostringstream out;
-    out << "mode=" << cfg_.mode
+    out << "mode=" << VisionCaptureSampling::DatasetModeName(mode)
         << " sampling=" << (sampling_running_.load(std::memory_order_acquire) ? 1 : 0)
-        << " accepted_total=" << samples << " last_reason=" << last_reject_reason_
+        << " accepted_total=" << samples
+        << " target=" << cfg_.camera_calibration.auto_save_views << " solver_views="
+        << (mode == VisionCaptureSampling::DatasetMode::INTRINSIC
+                ? camera_calibration_.AcceptedViewCount()
+                : 0U)
+        << " last_reason=" << last_reject_reason_
         << " last_pnp_rms_px=" << last_pnp_rms_px_
         << " last_gyro_norm_dps=" << last_gyro_norm_dps_
         << " last_acc_norm_mps2=" << last_acc_norm_mps2_;
@@ -792,13 +794,34 @@ class VisionCapture : public LibXR::Application
                          "accepted,reject_reason,pnp_ok,pnp_rms_px,"
                          "pnp_t_jitter_m,pnp_r_jitter_deg,imu_r_jitter_deg,"
                          "gyro_norm_dps,acc_norm_mps2,acc_norm_error_mps2,"
-                         "acc_norm_jitter_mps2,acc_dir_jitter_deg\n";
+                         "acc_norm_jitter_mps2,acc_dir_jitter_deg,"
+                         "acceleration_unit\n";
+        if (!metadata_csv_)
+        {
+          record_io_failed_ = true;
+          XR_LOG_ERROR("VisionCapture failed to open samples.csv");
+        }
+      }
+      frame_geometry_csv_.open(output_dir_ / "frame_geometry.csv", std::ios::out);
+      VisionCaptureRecording::WriteFrameGeometryHeader(frame_geometry_csv_);
+      if (!frame_geometry_csv_)
+      {
+        record_io_failed_ = true;
+        XR_LOG_ERROR("VisionCapture failed to open frame_geometry.csv");
       }
       WriteStaticCameraSnapshots();
     }
 
-    XR_LOG_PASS("VisionCapture output session=%s dir=%s", session_name_.c_str(),
-                output_dir_.string().c_str());
+    if (record_io_failed_)
+    {
+      XR_LOG_ERROR("VisionCapture output unavailable: session=%s dir=%s",
+                   session_name_.c_str(), output_dir_.string().c_str());
+    }
+    else
+    {
+      XR_LOG_PASS("VisionCapture output session=%s dir=%s", session_name_.c_str(),
+                  output_dir_.string().c_str());
+    }
   }
 
   template <std::size_t Size>
@@ -900,7 +923,6 @@ class VisionCapture : public LibXR::Application
     {
       std::ofstream out(output_dir_ / "frame_geometry.txt", std::ios::out);
       out << std::setprecision(17);
-      out << "epoch=" << geometry.epoch << "\n";
       out << "width=" << geometry.width << "\n";
       out << "height=" << geometry.height << "\n";
       out << "step=" << geometry.step << "\n";
@@ -998,12 +1020,6 @@ class VisionCapture : public LibXR::Application
 
     const uint64_t image_ts = static_cast<uint64_t>(image_frame->timestamp_us);
     const uint64_t imu_ts = static_cast<uint64_t>(frame.imu.timestamp_us);
-    const uint64_t dt_us = image_ts > imu_ts ? image_ts - imu_ts : imu_ts - image_ts;
-    if (cfg_.filter.require_synced_imu && dt_us > cfg_.filter.max_image_imu_dt_us)
-    {
-      return;
-    }
-
     const cv::Mat image = VisionCaptureDetail::MakeImageView<FrameLayoutV>(*image_frame);
     if (image.empty())
     {
@@ -1021,12 +1037,16 @@ class VisionCapture : public LibXR::Application
     {
       boards_detected_.fetch_add(1);
     }
-    SamplingDecision sampling =
-        EvaluateCalibrationSampling(detection, image_frame->geometry, frame.imu, dt_us);
-    SubmitPreview(image, detection);
+    SamplingDecision sampling = EvaluateCalibrationSampling(
+        detection, image_frame->geometry, frame.imu, image_ts);
     ProcessCameraCalibration(image, image_frame->geometry, image_ts, sampling.accepted);
+    SubmitPreview(image, detection, sampling, image_frame->geometry);
 
     if (!ShouldSaveFrames())
+    {
+      return;
+    }
+    if (record_io_failed_)
     {
       return;
     }
@@ -1044,11 +1064,26 @@ class VisionCapture : public LibXR::Application
       return;
     }
 
-    ++total_saved_frames_;
+    const uint64_t frame_id = total_saved_frames_ + 1U;
+    std::string image_path;
+    if (!SaveImage(image, frame_id, image_path))
+    {
+      record_io_failed_ = true;
+      return;
+    }
+    if (!WriteFrameGeometry(frame_id, image_path, image_frame->geometry) ||
+        !WriteMetadata(frame_id, image_ts, imu_ts, frame.imu, image_path, detection,
+                       sampling))
+    {
+      return;
+    }
+
+    if (!FlushCsvIfNeeded())
+    {
+      return;
+    }
+    total_saved_frames_ = frame_id;
     last_saved_timestamp_us_ = image_ts;
-    const std::string image_path = SaveImage(image, total_saved_frames_);
-    WriteMetadata(total_saved_frames_, image_ts, imu_ts, dt_us, frame.imu, image_path,
-                  detection, sampling);
     frames_saved_.fetch_add(1);
   }
 
@@ -1057,8 +1092,13 @@ class VisionCapture : public LibXR::Application
    */
   bool IsCalibrationDatasetMode() const
   {
-    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_handeye" ||
-           cfg_.mode == "calibrate_camera" || cfg_.camera_calibration.enabled;
+    return CurrentDatasetMode() != VisionCaptureSampling::DatasetMode::NONE;
+  }
+
+  VisionCaptureSampling::DatasetMode CurrentDatasetMode() const
+  {
+    return VisionCaptureSampling::ClassifyDatasetMode(cfg_.mode,
+                                                      cfg_.camera_calibration.enabled);
   }
 
   /**
@@ -1066,8 +1106,7 @@ class VisionCapture : public LibXR::Application
    */
   bool ShouldRunCameraCalibration() const
   {
-    return cfg_.mode == "calibrate" || cfg_.mode == "calibrate_camera" ||
-           cfg_.camera_calibration.enabled;
+    return CurrentDatasetMode() == VisionCaptureSampling::DatasetMode::INTRINSIC;
   }
 
   /**
@@ -1132,6 +1171,8 @@ class VisionCapture : public LibXR::Application
     cv::Mat rvec{};
     /// solvePnP 得到的平移向量。
     cv::Mat tvec{};
+    /// 当前相机模型将标定板角点重投影回本帧后的像素坐标。
+    std::vector<cv::Point2f> projected_frame_points{};
   };
 
   /**
@@ -1151,6 +1192,23 @@ class VisionCapture : public LibXR::Application
     cv::Vec3d gyro{};
     /// 当前帧线加速度，单位 m/s^2。
     cv::Vec3d acc{};
+  };
+
+  /**
+   * @brief 异步预览线程绘制一帧所需的不可变状态快照。
+   */
+  struct PreviewSnapshot
+  {
+    VisionCaptureSampling::DatasetMode mode{VisionCaptureSampling::DatasetMode::NONE};
+    VisionCaptureSampling::FrameProfile profile{
+        VisionCaptureSampling::FrameProfile::UNKNOWN};
+    FrameGeometry geometry{};
+    SamplingDecision sampling{};
+    VisionCaptureSampling::VisualCoverage coverage{};
+    uint64_t accepted_total{0};
+    uint32_t accepted_target{0};
+    std::size_t solver_views{0};
+    uint32_t solver_target{0};
   };
 
   /**
@@ -1184,7 +1242,8 @@ class VisionCapture : public LibXR::Application
       VisionCaptureCalibrationBoard::CollectBoardPoints(
           detection.marker_corners, detection.marker_ids, board, detection);
       detection.homography_rms = VisionCaptureCalibrationBoard::HomographyRms(
-          detection.object_points, detection.image_points);
+          detection.object_points, detection.image_points,
+          &detection.homography_projected_points);
       VisionCaptureCalibrationBoard::FillQuality(image, geometry.width, geometry.height,
                                                  detection);
     }
@@ -1196,7 +1255,9 @@ class VisionCapture : public LibXR::Application
    */
   const cv::aruco::Dictionary& SamplingDictionary() const
   {
-    return ShouldRunCameraCalibration() ? camera_sampling_dictionary_ : dictionary_;
+    return VisionCaptureSampling::UsesGShangBoard(CurrentDatasetMode())
+               ? camera_sampling_dictionary_
+               : dictionary_;
   }
 
   /**
@@ -1204,7 +1265,7 @@ class VisionCapture : public LibXR::Application
    */
   VisionCaptureCalibrationBoard::BoardMap SamplingBoard() const
   {
-    if (!ShouldRunCameraCalibration())
+    if (!VisionCaptureSampling::UsesGShangBoard(CurrentDatasetMode()))
     {
       return VisionCaptureCalibrationBoard::MakeSingleArucoBoard(
           cfg_.board.marker_length_m);
@@ -1321,6 +1382,14 @@ class VisionCapture : public LibXR::Application
       cv::projectPoints(detection.object_points, pose.rvec, pose.tvec, camera_matrix,
                         distortion, projected_native);
       decision.pnp_rms_px = FrameReprojectionRms(detection, projected_native, geometry);
+      decision.projected_frame_points.reserve(projected_native.size());
+      for (const cv::Point2f& point : projected_native)
+      {
+        const auto frame_point = CameraTypes::NativeToFrame(
+            geometry, static_cast<double>(point.x), static_cast<double>(point.y));
+        decision.projected_frame_points.emplace_back(static_cast<float>(frame_point[0]),
+                                                     static_cast<float>(frame_point[1]));
+      }
       decision.rvec = pose.rvec;
       decision.tvec = pose.tvec;
     }
@@ -1329,7 +1398,8 @@ class VisionCapture : public LibXR::Application
       decision.reason = "pnp_exception";
       return false;
     }
-    if (decision.pnp_rms_px > cfg_.calibration_sampling.max_pnp_reprojection_rms_px)
+    if (!std::isfinite(decision.pnp_rms_px) ||
+        decision.pnp_rms_px > cfg_.calibration_sampling.max_pnp_reprojection_rms_px)
     {
       decision.reason = "pnp_rms";
       return false;
@@ -1338,54 +1408,161 @@ class VisionCapture : public LibXR::Application
     return true;
   }
 
+  static VisionCaptureSampling::VisualSample MakeVisualSample(
+      const BoardObservation& detection, uint64_t image_timestamp_us)
+  {
+    return {
+        .observed = detection.observed,
+        .image_timestamp_us = image_timestamp_us,
+        .used_markers = detection.used_markers,
+        .homography_rms = detection.homography_rms,
+        .sharpness_score = detection.sharpness_score,
+        .center_x_norm = detection.center_x_norm,
+        .center_y_norm = detection.center_y_norm,
+        .scale_norm = detection.scale_norm,
+        .angle_deg = detection.angle_deg,
+    };
+  }
+
+  VisionCaptureSampling::IntrinsicLimits IntrinsicSamplingLimits() const
+  {
+    VisionCaptureSampling::IntrinsicLimits limits;
+    limits.minimum_markers = VisionCaptureSampling::RequiredGShangMarkerCount(
+        cfg_.camera_calibration.cols, cfg_.camera_calibration.rows);
+    limits.minimum_interval_us = cfg_.calibration_sampling.min_accept_interval_us;
+    return limits;
+  }
+
+  SamplingDecision RejectSampling(SamplingDecision decision, std::string_view reason)
+  {
+    decision.reason = VisionCaptureDetail::ToString(reason);
+    sampling_rejected_.fetch_add(1);
+    SetLastSamplingStatus(decision);
+    return decision;
+  }
+
+  SamplingDecision AcceptSampling(SamplingDecision decision, std::string_view reason)
+  {
+    decision.accepted = true;
+    decision.reason = VisionCaptureDetail::ToString(reason);
+    sampling_accepted_.fetch_add(1);
+    sampling_accepted_total_.fetch_add(1, std::memory_order_acq_rel);
+    SetLastSamplingStatus(decision);
+    return decision;
+  }
+
   /**
-   * @brief 对一帧图像和 IMU 执行判稳采样。
+   * @brief 仅用 GShang 视觉观测和相机时间戳筛选内参样本。
    */
-  SamplingDecision EvaluateCalibrationSampling(const BoardObservation& detection,
-                                               const FrameGeometry& geometry,
-                                               const ImuStamped& imu, uint64_t dt_us)
+  SamplingDecision EvaluateIntrinsicSampling(const BoardObservation& detection,
+                                             uint64_t image_timestamp_us)
   {
     SamplingDecision decision;
-    if (!IsCalibrationDatasetMode() || !cfg_.calibration_sampling.enabled)
+    decision.projected_frame_points = detection.homography_projected_points;
+    const auto sample = MakeVisualSample(detection, image_timestamp_us);
+    const auto limits = IntrinsicSamplingLimits();
+    const bool force_snapshot = force_snapshot_.load(std::memory_order_acquire);
+    VisionCaptureSampling::AdmissionResult admission;
     {
-      decision.accepted = true;
-      decision.reason = "record_all";
-      SetLastSamplingStatus(decision);
-      return decision;
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      if (sample.observed && sample.used_markers >= limits.minimum_markers &&
+          VisionCaptureSampling::VisualMetricsFinite(sample) &&
+          sample.homography_rms <= limits.max_homography_rms)
+      {
+        best_intrinsic_sharpness_score_ =
+            std::max(best_intrinsic_sharpness_score_, sample.sharpness_score);
+      }
+      admission = VisionCaptureSampling::EvaluateIntrinsicObservation(
+          sample,
+          std::span<const VisionCaptureSampling::VisualSample>(accepted_visual_samples_),
+          last_intrinsic_accept_timestamp_us_, best_intrinsic_sharpness_score_, limits,
+          force_snapshot);
+      if (admission.accepted)
+      {
+        accepted_visual_samples_.push_back(sample);
+        last_intrinsic_accept_timestamp_us_ = sample.image_timestamp_us;
+      }
     }
-    if (!sampling_running_.load(std::memory_order_acquire))
+    if (!admission.accepted)
     {
-      decision.reason = "sampling_paused";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      return RejectSampling(std::move(decision), admission.reason);
     }
-    if (dt_us > cfg_.filter.max_image_imu_dt_us)
+    if (force_snapshot)
     {
-      decision.reason = "sync_dt";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      force_snapshot_.store(false, std::memory_order_release);
+    }
+    return AcceptSampling(std::move(decision), admission.reason);
+  }
+
+  /**
+   * @brief 用冻结 K/D 的 PnP 和同步 IMU 稳定性筛选手眼数据。
+   */
+  SamplingDecision EvaluateHandEyeSampling(const BoardObservation& detection,
+                                           const FrameGeometry& geometry,
+                                           const ImuStamped& imu,
+                                           uint64_t image_timestamp_us)
+  {
+    SamplingDecision decision;
+    const uint64_t imu_timestamp_us = static_cast<uint64_t>(imu.timestamp_us);
+    if (image_timestamp_us == 0U)
+    {
+      return RejectSampling(std::move(decision), "image_timestamp_invalid");
+    }
+    if (!VisionCaptureSampling::ImuSampleUsable(imu_timestamp_us, imu.rotation_wxyz,
+                                                imu.angular_velocity_xyz,
+                                                imu.linear_acceleration_xyz))
+    {
+      if (imu_timestamp_us == 0U)
+      {
+        return RejectSampling(std::move(decision), "imu_timestamp_invalid");
+      }
+      if (!VisionCaptureSampling::AllFinite(imu.rotation_wxyz))
+      {
+        return RejectSampling(std::move(decision), "imu_quaternion_nonfinite");
+      }
+      if (!VisionCaptureSampling::QuaternionUsable(imu.rotation_wxyz))
+      {
+        return RejectSampling(std::move(decision), "imu_quaternion_invalid");
+      }
+      if (!VisionCaptureSampling::AllFinite(imu.angular_velocity_xyz))
+      {
+        return RejectSampling(std::move(decision), "imu_gyro_nonfinite");
+      }
+      return RejectSampling(std::move(decision), "imu_acceleration_nonfinite");
     }
     if (!SolveMarkerPnp(detection, geometry, decision))
     {
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      const std::string reason = decision.reason;
+      return RejectSampling(std::move(decision), reason);
     }
     sampling_pnp_ok_.fetch_add(1);
 
     StableSample sample;
-    sample.timestamp_us = static_cast<uint64_t>(imu.timestamp_us);
+    sample.timestamp_us = imu_timestamp_us;
     sample.rvec = decision.rvec.clone();
     sample.tvec = decision.tvec.clone();
     sample.quat = VisionCaptureDetail::NormalizeQuatWxyz(imu.rotation_wxyz);
     sample.gyro = VisionCaptureDetail::ToVec3d(imu.angular_velocity_xyz);
     sample.acc = VisionCaptureDetail::ToVec3d(imu.linear_acceleration_xyz);
     decision.gyro_norm_dps = VisionCaptureDetail::RadToDeg(cv::norm(sample.gyro));
-    decision.acc_norm_mps2 = cv::norm(sample.acc);
-    decision.acc_norm_error_mps2 = std::fabs(decision.acc_norm_mps2 - kGravityMps2);
+    decision.acc_norm_mps2 =
+        VisionCaptureSampling::AccelerationNormMps2(imu.linear_acceleration_xyz);
+    decision.acc_norm_error_mps2 =
+        std::fabs(decision.acc_norm_mps2 - VisionCaptureSampling::kStandardGravityMps2);
 
+    const auto absolute_imu = VisionCaptureSampling::EvaluateHandEyeAbsoluteImu(
+        decision.gyro_norm_dps, decision.acc_norm_mps2,
+        cfg_.calibration_sampling.max_gyro_norm_dps,
+        cfg_.calibration_sampling.max_acc_norm_error_mps2);
+    if (!absolute_imu.accepted)
+    {
+      return RejectSampling(std::move(decision), absolute_imu.reason);
+    }
+
+    if (cfg_.calibration_sampling.window_size == 0U)
+    {
+      return RejectSampling(std::move(decision), "stability_window_invalid");
+    }
     const bool force_snapshot =
         force_snapshot_.exchange(false, std::memory_order_acq_rel);
     {
@@ -1397,92 +1574,85 @@ class VisionCapture : public LibXR::Application
       }
       if (stability_window_.size() < cfg_.calibration_sampling.window_size)
       {
-        decision.reason = "stability_window";
-        sampling_rejected_.fetch_add(1);
-        SetLastSamplingStatus(decision);
-        return decision;
+        return RejectSampling(std::move(decision), "stability_window");
       }
-
       ComputeWindowStabilityLocked(sample, decision);
     }
     if (decision.pnp_t_jitter_m > cfg_.calibration_sampling.max_pnp_translation_jitter_m)
     {
-      decision.reason = "pnp_translation_unstable";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      return RejectSampling(std::move(decision), "pnp_translation_unstable");
     }
     if (decision.pnp_r_jitter_deg > cfg_.calibration_sampling.max_pnp_rotation_jitter_deg)
     {
-      decision.reason = "pnp_rotation_unstable";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      return RejectSampling(std::move(decision), "pnp_rotation_unstable");
     }
     if (decision.imu_r_jitter_deg > cfg_.calibration_sampling.max_imu_rotation_jitter_deg)
     {
-      decision.reason = "imu_rotation_unstable";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
-    }
-    if (decision.gyro_norm_dps > cfg_.calibration_sampling.max_gyro_norm_dps)
-    {
-      decision.reason = "gyro_moving";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
-    }
-    if (decision.acc_norm_error_mps2 > cfg_.calibration_sampling.max_acc_norm_error_mps2)
-    {
-      decision.reason = "acc_not_gravity";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      return RejectSampling(std::move(decision), "imu_rotation_unstable");
     }
     if (decision.acc_norm_jitter_mps2 >
         cfg_.calibration_sampling.max_acc_norm_jitter_mps2)
     {
-      decision.reason = "acc_vibration";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      return RejectSampling(std::move(decision), "acc_vibration");
     }
     if (decision.acc_dir_jitter_deg >
         cfg_.calibration_sampling.max_acc_direction_jitter_deg)
     {
-      decision.reason = "acc_direction_unstable";
-      sampling_rejected_.fetch_add(1);
-      SetLastSamplingStatus(decision);
-      return decision;
+      return RejectSampling(std::move(decision), "acc_direction_unstable");
     }
     {
       std::lock_guard<std::mutex> lock(sampling_mutex_);
-      if (!force_snapshot && last_accepted_sample_.timestamp_us != 0 &&
-          sample.timestamp_us > last_accepted_sample_.timestamp_us &&
+      if (last_accepted_sample_.timestamp_us != 0U &&
+          sample.timestamp_us <= last_accepted_sample_.timestamp_us)
+      {
+        return RejectSampling(std::move(decision), "imu_timestamp_non_monotonic");
+      }
+      if (!force_snapshot && last_accepted_sample_.timestamp_us != 0U &&
           sample.timestamp_us - last_accepted_sample_.timestamp_us <
               cfg_.calibration_sampling.min_accept_interval_us)
       {
-        decision.reason = "accept_interval";
-        sampling_rejected_.fetch_add(1);
-        SetLastSamplingStatus(decision);
-        return decision;
+        return RejectSampling(std::move(decision), "accept_interval");
       }
       if (!force_snapshot && IsDuplicateCalibrationSampleLocked(sample))
       {
-        decision.reason = "duplicate_pose";
-        sampling_rejected_.fetch_add(1);
-        SetLastSamplingStatus(decision);
-        return decision;
+        return RejectSampling(std::move(decision), "duplicate_pose");
       }
       accepted_calibration_samples_.push_back(sample);
+      accepted_visual_samples_.push_back(MakeVisualSample(detection, image_timestamp_us));
       last_accepted_sample_ = sample;
     }
-    decision.accepted = true;
-    decision.reason = force_snapshot ? "snapshot" : "accepted";
-    sampling_accepted_.fetch_add(1);
-    SetLastSamplingStatus(decision);
-    return decision;
+    return AcceptSampling(std::move(decision), force_snapshot ? "snapshot" : "accepted");
+  }
+
+  /**
+   * @brief 按运行模式选择内参视觉采样或手眼 PnP/IMU 判稳。
+   */
+  SamplingDecision EvaluateCalibrationSampling(const BoardObservation& detection,
+                                               const FrameGeometry& geometry,
+                                               const ImuStamped& imu,
+                                               uint64_t image_timestamp_us)
+  {
+    SamplingDecision decision;
+    const auto mode = CurrentDatasetMode();
+    const auto control = VisionCaptureSampling::EvaluateSamplingControl(
+        mode, cfg_.calibration_sampling.enabled,
+        sampling_running_.load(std::memory_order_acquire));
+    if (mode == VisionCaptureSampling::DatasetMode::NONE)
+    {
+      decision.accepted = true;
+      decision.reason = control.reason;
+      SetLastSamplingStatus(decision);
+      return decision;
+    }
+    if (!control.accepted)
+    {
+      return RejectSampling(std::move(decision), control.reason);
+    }
+    if (mode == VisionCaptureSampling::DatasetMode::INTRINSIC)
+    {
+      return EvaluateIntrinsicSampling(detection, image_timestamp_us);
+    }
+    return EvaluateHandEyeSampling(detection, geometry, imu, image_timestamp_us);
   }
 
   /**
@@ -1574,10 +1744,128 @@ class VisionCapture : public LibXR::Application
     last_acc_norm_mps2_ = decision.acc_norm_mps2;
   }
 
+  PreviewSnapshot BuildPreviewSnapshot(const SamplingDecision& sampling,
+                                       const FrameGeometry& geometry) const
+  {
+    PreviewSnapshot snapshot;
+    snapshot.mode = CurrentDatasetMode();
+    snapshot.profile = VisionCaptureSampling::ClassifyFrameProfile(
+        calibration_.native_width, calibration_.native_height, geometry);
+    snapshot.geometry = geometry;
+    snapshot.sampling = sampling;
+    snapshot.accepted_total = sampling_accepted_total_.load(std::memory_order_acquire);
+    snapshot.accepted_target = cfg_.camera_calibration.auto_save_views;
+    if (snapshot.mode == VisionCaptureSampling::DatasetMode::INTRINSIC)
+    {
+      snapshot.solver_views = camera_calibration_.AcceptedViewCount();
+      snapshot.solver_target = cfg_.camera_calibration.auto_save_views;
+    }
+    {
+      std::lock_guard<std::mutex> lock(sampling_mutex_);
+      snapshot.coverage = VisionCaptureSampling::ComputeVisualCoverage(
+          std::span<const VisionCaptureSampling::VisualSample>(accepted_visual_samples_));
+    }
+    return snapshot;
+  }
+
+  static void DrawPreviewOverlay(cv::Mat& frame, const BoardObservation& detection,
+                                 const PreviewSnapshot& snapshot)
+  {
+    if (detection.observed && !detection.marker_ids.empty())
+    {
+      cv::aruco::drawDetectedMarkers(frame, detection.marker_corners,
+                                     detection.marker_ids);
+    }
+    for (const cv::Point2f& point : detection.image_points)
+    {
+      cv::circle(frame, point, 3, {0, 255, 255}, cv::FILLED, cv::LINE_AA);
+    }
+    for (const cv::Point2f& point : snapshot.sampling.projected_frame_points)
+    {
+      cv::drawMarker(frame, point, {255, 0, 255}, cv::MARKER_CROSS, 10, 2, cv::LINE_AA);
+    }
+
+    const cv::Scalar status_color =
+        snapshot.sampling.accepted ? cv::Scalar{0, 220, 0} : cv::Scalar{0, 0, 255};
+    int y = 26;
+    auto draw_line = [&](const std::string& text, const cv::Scalar& color)
+    {
+      VisionCaptureDetail::DrawOutlinedText(frame, text, {12, y}, color, 0.55);
+      y += 24;
+    };
+
+    std::ostringstream line;
+    line << VisionCaptureSampling::DatasetModeName(snapshot.mode) << " "
+         << (snapshot.sampling.accepted ? "ACCEPT" : "REJECT") << " "
+         << snapshot.sampling.reason;
+    draw_line(line.str(), status_color);
+
+    line.str("");
+    line.clear();
+    line << std::fixed << std::setprecision(3) << "VIS markers=" << detection.used_markers
+         << " H=" << detection.homography_rms << " S=" << std::setprecision(1)
+         << detection.sharpness_score << " center=(" << std::setprecision(3)
+         << detection.center_x_norm << "," << detection.center_y_norm << ")";
+    draw_line(line.str(), {0, 255, 255});
+
+    line.str("");
+    line.clear();
+    line << std::fixed << std::setprecision(3) << "VIS scale=" << detection.scale_norm
+         << " angle=" << std::setprecision(1) << detection.angle_deg << " cover=("
+         << std::setprecision(3) << snapshot.coverage.center_span_x << ","
+         << snapshot.coverage.center_span_y
+         << ") ratio=" << snapshot.coverage.scale_ratio;
+    draw_line(line.str(), {0, 255, 255});
+
+    line.str("");
+    line.clear();
+    line << "SAMPLES " << snapshot.accepted_total << "/" << snapshot.accepted_target
+         << " SOLVER " << snapshot.solver_views << "/" << snapshot.solver_target;
+    draw_line(line.str(), {255, 255, 255});
+
+    line.str("");
+    line.clear();
+    line << "PROFILE=" << VisionCaptureSampling::FrameProfileName(snapshot.profile)
+         << " FRAME=" << snapshot.geometry.width << "x" << snapshot.geometry.height
+         << " STEP=" << snapshot.geometry.step;
+    draw_line(line.str(), {255, 255, 255});
+
+    line.str("");
+    line.clear();
+    line << std::fixed << std::setprecision(2) << "ROI=("
+         << snapshot.geometry.roi_offset_x_native << ","
+         << snapshot.geometry.roi_offset_y_native << ") DEC=("
+         << snapshot.geometry.decimation_x << "," << snapshot.geometry.decimation_y
+         << ") PHASE=(" << snapshot.geometry.sample_phase_x_native << ","
+         << snapshot.geometry.sample_phase_y_native
+         << ") FLAGS=" << snapshot.geometry.flags;
+    draw_line(line.str(), {255, 255, 255});
+
+    if (snapshot.mode == VisionCaptureSampling::DatasetMode::HAND_EYE)
+    {
+      line.str("");
+      line.clear();
+      line << std::fixed << std::setprecision(3)
+           << "PNP rms=" << snapshot.sampling.pnp_rms_px
+           << " t_jitter=" << snapshot.sampling.pnp_t_jitter_m
+           << "m r_jitter=" << snapshot.sampling.pnp_r_jitter_deg << "deg";
+      draw_line(line.str(), {255, 0, 255});
+
+      line.str("");
+      line.clear();
+      line << std::fixed << std::setprecision(3)
+           << "IMU r_jitter=" << snapshot.sampling.imu_r_jitter_deg
+           << "deg gyro=" << snapshot.sampling.gyro_norm_dps
+           << "deg/s acc=" << snapshot.sampling.acc_norm_mps2 << "m/s2";
+      draw_line(line.str(), {255, 0, 255});
+    }
+  }
+
   /**
-   * @brief 提交预览图并绘制标定板角点。
+   * @brief 非阻塞提交检测、重投影、判定、进度和逐帧几何预览。
    */
-  void SubmitPreview(const cv::Mat& image, const BoardObservation& detection)
+  void SubmitPreview(const cv::Mat& image, const BoardObservation& detection,
+                     const SamplingDecision& sampling, const FrameGeometry& geometry)
   {
     if (!preview_.Running())
     {
@@ -1589,32 +1877,66 @@ class VisionCapture : public LibXR::Application
     {
       return;
     }
-    preview_.Submit(preview_image,
-                    [detection](cv::Mat& frame)
-                    {
-                      if (detection.observed)
-                      {
-                        cv::aruco::drawDetectedMarkers(frame, detection.marker_corners,
-                                                       detection.marker_ids);
-                      }
-                    });
+    const PreviewSnapshot snapshot = BuildPreviewSnapshot(sampling, geometry);
+    preview_.Submit(preview_image, [detection, snapshot](cv::Mat& frame)
+                    { DrawPreviewOverlay(frame, detection, snapshot); });
   }
 
   /**
    * @brief 按帧号保存图像并返回文件路径。
+   *
+   * @return true 表示未要求写图或图像已经成功写盘。
    */
-  std::string SaveImage(const cv::Mat& image, uint64_t frame_id)
+  bool SaveImage(const cv::Mat& image, uint64_t frame_id, std::string& image_path)
   {
+    image_path.clear();
     if (!cfg_.record.save_images)
     {
-      return {};
+      return true;
     }
     std::ostringstream name;
     name << std::setw(8) << std::setfill('0') << frame_id << "."
          << cfg_.record.image_format;
     const std::filesystem::path path = frames_dir_ / name.str();
-    cv::imwrite(path.string(), image);
-    return path.string();
+    try
+    {
+      if (!cv::imwrite(path.string(), image))
+      {
+        XR_LOG_ERROR("VisionCapture image write failed: %s", path.string().c_str());
+        return false;
+      }
+    }
+    catch (const cv::Exception& e)
+    {
+      XR_LOG_ERROR("VisionCapture image write failed %s: %s", path.string().c_str(),
+                   e.what());
+      return false;
+    }
+    image_path = path.string();
+    return true;
+  }
+
+  /**
+   * @brief 写入一帧完整采样几何。
+   */
+  bool WriteFrameGeometry(uint64_t frame_id, const std::string& image_path,
+                          const FrameGeometry& geometry)
+  {
+    if (!frame_geometry_csv_.is_open())
+    {
+      record_io_failed_ = true;
+      XR_LOG_ERROR("VisionCapture frame_geometry.csv is not open");
+      return false;
+    }
+    VisionCaptureRecording::WriteFrameGeometryRow(frame_geometry_csv_, frame_id,
+                                                  image_path, geometry);
+    if (!frame_geometry_csv_)
+    {
+      record_io_failed_ = true;
+      XR_LOG_ERROR("VisionCapture frame_geometry.csv write failed");
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -1637,23 +1959,28 @@ class VisionCapture : public LibXR::Application
   /**
    * @brief 写入一行同步帧和采样状态元数据。
    */
-  void WriteMetadata(uint64_t frame_id, uint64_t image_ts, uint64_t imu_ts,
-                     uint64_t dt_us, const ImuStamped& imu, const std::string& image_path,
+  bool WriteMetadata(uint64_t frame_id, uint64_t image_ts, uint64_t imu_ts,
+                     const ImuStamped& imu, const std::string& image_path,
                      const BoardObservation& detection, const SamplingDecision& sampling)
   {
+    if (!cfg_.record.save_metadata)
+    {
+      return true;
+    }
     if (!metadata_csv_.is_open())
     {
-      return;
+      record_io_failed_ = true;
+      XR_LOG_ERROR("VisionCapture samples.csv is not open");
+      return false;
     }
-    metadata_csv_ << frame_id << "," << image_ts << "," << imu_ts << "," << dt_us << ","
-                  << imu.rotation_wxyz[0] << "," << imu.rotation_wxyz[1] << ","
-                  << imu.rotation_wxyz[2] << "," << imu.rotation_wxyz[3] << ","
-                  << imu.angular_velocity_xyz[0] << "," << imu.angular_velocity_xyz[1]
-                  << "," << imu.angular_velocity_xyz[2] << ","
-                  << imu.linear_acceleration_xyz[0] << ","
-                  << imu.linear_acceleration_xyz[1] << ","
-                  << imu.linear_acceleration_xyz[2] << "," << image_path << ","
-                  << (detection.observed ? 1 : 0) << ","
+    // 相机和 MCU 时间戳属于不同时间域；保留兼容 dt_us 列但永远不相减。
+    metadata_csv_ << frame_id << "," << image_ts << "," << imu_ts << ",";
+    VisionCaptureRecording::WriteRawImuCells(metadata_csv_, cfg_.record.save_raw_imu,
+                                             imu.rotation_wxyz, imu.angular_velocity_xyz,
+                                             imu.linear_acceleration_xyz);
+    metadata_csv_ << ",";
+    VisionCaptureRecording::WriteCsvCell(metadata_csv_, image_path);
+    metadata_csv_ << "," << (detection.observed ? 1 : 0) << ","
                   << detection.marker_ids_vec.size() << ","
                   << JoinIds(detection.marker_ids_vec) << ","
                   << (sampling.accepted ? 1 : 0) << "," << sampling.reason << ","
@@ -1662,21 +1989,59 @@ class VisionCapture : public LibXR::Application
                   << sampling.imu_r_jitter_deg << "," << sampling.gyro_norm_dps << ","
                   << sampling.acc_norm_mps2 << "," << sampling.acc_norm_error_mps2 << ","
                   << sampling.acc_norm_jitter_mps2 << "," << sampling.acc_dir_jitter_deg
-                  << "\n";
-    metadata_csv_.flush();
+                  << ",mps2\n";
+    if (!metadata_csv_)
+    {
+      record_io_failed_ = true;
+      XR_LOG_ERROR("VisionCapture samples.csv write failed");
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @brief 按 flush_every_n 同步刷新本次记录的两个 CSV。
+   */
+  bool FlushCsvIfNeeded()
+  {
+    ++csv_rows_written_;
+    if (!VisionCaptureRecording::ShouldFlush(csv_rows_written_,
+                                             cfg_.record.flush_every_n))
+    {
+      return true;
+    }
+    if (metadata_csv_.is_open())
+    {
+      metadata_csv_.flush();
+      if (!metadata_csv_)
+      {
+        record_io_failed_ = true;
+        XR_LOG_ERROR("VisionCapture samples.csv flush failed");
+      }
+    }
+    if (frame_geometry_csv_.is_open())
+    {
+      frame_geometry_csv_.flush();
+      if (!frame_geometry_csv_)
+      {
+        record_io_failed_ = true;
+        XR_LOG_ERROR("VisionCapture frame_geometry.csv flush failed");
+      }
+    }
+    return !record_io_failed_;
   }
 
  private:
   /// 模块运行配置。
   Config cfg_{};
-  /// 同步帧来源。
-  Sync* sync_{nullptr};
   /// 构造时从 CameraFrameSync 复制的原生相机标定。
   const CameraCalibration calibration_;
   /// 可选预览输出。
   VisionPreview preview_{};
-  /// 同步帧消费线程。
-  LibXR::Thread worker_thread_{};
+  /// 同步帧进程内 Topic。
+  LibXR::Topic synced_frame_topic_ = LibXR::Topic();
+  /// 同步帧借用回调。
+  LibXR::Topic::Callback synced_frame_callback_{};
   /// 标准输入命令线程。
   LibXR::Thread control_thread_{};
 
@@ -1690,8 +2055,6 @@ class VisionCapture : public LibXR::Application
   /// 相机内参标定流程对象。
   VisionCaptureCameraCalibration<FrameLayoutV> camera_calibration_;
 
-  /// 标准重力加速度，单位 m/s^2。
-  static constexpr double kGravityMps2 = 9.80665;
   /// 标定采样是否正在运行。
   std::atomic<bool> sampling_running_{true};
   /// 是否强制接受下一帧有效 PnP 样本。
@@ -1702,8 +2065,14 @@ class VisionCapture : public LibXR::Application
   std::deque<StableSample> stability_window_{};
   /// 已保存的判稳样本。
   std::vector<StableSample> accepted_calibration_samples_{};
+  /// 已接受样本的视觉观测，用于内参去重和预览覆盖统计。
+  std::vector<VisionCaptureSampling::VisualSample> accepted_visual_samples_{};
   /// 最近一次通过判稳的样本。
   StableSample last_accepted_sample_{};
+  /// 最近一次接受内参视觉样本的相机时间戳。
+  uint64_t last_intrinsic_accept_timestamp_us_{0};
+  /// 本轮内参视觉样本中已见到的最佳清晰度。
+  double best_intrinsic_sharpness_score_{0.0};
   /// 保护最近一次采样状态文本。
   mutable std::mutex status_mutex_{};
   /// 最近一次采样判定原因。
@@ -1723,9 +2092,15 @@ class VisionCapture : public LibXR::Application
   std::filesystem::path frames_dir_{};
   /// 同步帧元数据 CSV。
   std::ofstream metadata_csv_{};
+  /// 每个成功记录帧的完整采样几何 CSV。
+  std::ofstream frame_geometry_csv_{};
 
   /// 已保存帧总数。
   uint64_t total_saved_frames_{0};
+  /// 已成功写入记录 CSV 的行数。
+  uint64_t csv_rows_written_{0};
+  /// 记录 I/O 失败锁存；置位后停止分配帧号，避免复用半写记录的 ID。
+  bool record_io_failed_{false};
   /// 最近一次保存图像的时间戳，单位 us。
   uint64_t last_saved_timestamp_us_{0};
   /// 是否已经打印过不支持图像编码错误。
@@ -1745,6 +2120,8 @@ class VisionCapture : public LibXR::Application
   std::atomic<uint64_t> sampling_pnp_ok_{0};
   /// monitor 周期内接受的标定样本数。
   std::atomic<uint64_t> sampling_accepted_{0};
+  /// 本轮从 reset 开始累计接受的标定样本数，不随 monitor 清零。
+  std::atomic<uint64_t> sampling_accepted_total_{0};
   /// monitor 周期内拒绝的标定样本数。
   std::atomic<uint64_t> sampling_rejected_{0};
 };
