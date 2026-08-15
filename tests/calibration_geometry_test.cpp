@@ -1,13 +1,28 @@
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <limits>
+#include <span>
+#include <sstream>
+#include <string>
 #include <string_view>
 
 #include "VisionCaptureCalibrationGeometry.hpp"
+#include "VisionCaptureCalibrationQuality.hpp"
+#include "VisionCaptureCameraCalibration.hpp"
+#include "VisionCaptureRecording.hpp"
+#include "VisionCaptureSampling.hpp"
 
 namespace
 {
+inline constexpr CameraTypes::FrameLayout kFullNativeLayout{1440, 1080, 4320,
+                                                            CameraTypes::Encoding::BGR8};
+
 void Expect(bool condition, const char* message)
 {
   if (!condition)
@@ -29,7 +44,22 @@ void ExpectNear(double actual, double expected, const char* message)
 CameraTypes::FrameGeometry MakeGeometry(uint16_t decimation_x, uint16_t decimation_y,
                                         uint16_t flags = 0)
 {
-  return {1, 720, 540, 2160, 11, 13, decimation_x, decimation_y, flags, 0, 0.0F, 0.0F};
+  return {720, 540, 2160, 11, 13, decimation_x, decimation_y, flags, 0, 0.0F, 0.0F};
+}
+
+VisionCaptureSampling::VisualSample MakeVisualSample(uint64_t timestamp_us)
+{
+  return {
+      .observed = true,
+      .image_timestamp_us = timestamp_us,
+      .used_markers = VisionCaptureSampling::RequiredGShangMarkerCount(),
+      .homography_rms = 0.5,
+      .sharpness_score = 100.0,
+      .center_x_norm = 0.5,
+      .center_y_norm = 0.5,
+      .scale_norm = 0.2,
+      .angle_deg = 20.0,
+  };
 }
 
 void TestFrameResidualPreservesFramePixelUnits()
@@ -71,6 +101,335 @@ void TestGeneratedLayoutName()
              std::string_view{"MainFrameLayout"},
          "calibration snippet must use the active preset layout name");
 }
+
+void TestDatasetModePolicy()
+{
+  using VisionCaptureSampling::ClassifyDatasetMode;
+  using VisionCaptureSampling::DatasetMode;
+
+  Expect(ClassifyDatasetMode("calibrate_camera", false) == DatasetMode::INTRINSIC,
+         "calibrate_camera must select intrinsic mode");
+  Expect(ClassifyDatasetMode("calibrate", false) == DatasetMode::INTRINSIC,
+         "legacy calibrate must select intrinsic mode");
+  Expect(ClassifyDatasetMode("record", true) == DatasetMode::INTRINSIC,
+         "record plus camera_calibration.enabled must select intrinsic mode");
+  Expect(ClassifyDatasetMode("calibrate_handeye", true) == DatasetMode::HAND_EYE,
+         "hand-eye mode must win conflicting intrinsic flags");
+  Expect(ClassifyDatasetMode("other", true) == DatasetMode::NONE,
+         "camera calibration flag must not reinterpret an unknown mode");
+  Expect(VisionCaptureSampling::UsesGShangBoard(DatasetMode::INTRINSIC) &&
+             VisionCaptureSampling::UsesGShangBoard(DatasetMode::HAND_EYE),
+         "both calibration modes must use the GShang board");
+  Expect(!VisionCaptureSampling::RequiresImuStability(DatasetMode::INTRINSIC) &&
+             VisionCaptureSampling::RequiresImuStability(DatasetMode::HAND_EYE),
+         "only hand-eye mode may require IMU stability");
+  Expect(
+      !VisionCaptureSampling::EvaluateSamplingControl(DatasetMode::INTRINSIC, false, true)
+              .accepted &&
+          !VisionCaptureSampling::EvaluateSamplingControl(DatasetMode::HAND_EYE, false,
+                                                          true)
+               .accepted,
+      "calibration modes must fail closed when sampling is disabled");
+  Expect(VisionCaptureSampling::ShouldSaveRawImu(DatasetMode::HAND_EYE, false) &&
+             !VisionCaptureSampling::ShouldSaveRawImu(DatasetMode::INTRINSIC, false),
+         "hand-eye must force raw IMU while intrinsic preserves the record option");
+  Expect(VisionCaptureSampling::kGShangMarkerSizeMm == 25.0 &&
+             VisionCaptureSampling::kGShangColumns == 8 &&
+             VisionCaptureSampling::kGShangRows == 6 &&
+             VisionCaptureSampling::GShangMarkerCount() == 24 &&
+             VisionCaptureSampling::RequiredGShangMarkerCount() == 16,
+         "GShang policy must stay fixed at 25 mm 8x6 with 16 visible markers");
+}
+
+void TestIntrinsicVisualAdmission()
+{
+  const VisionCaptureSampling::IntrinsicLimits limits{};
+  const std::span<const VisionCaptureSampling::VisualSample> none{};
+  const auto sample = MakeVisualSample(1000000);
+  const auto good = VisionCaptureSampling::EvaluateIntrinsicObservation(
+      sample, none, 0, sample.sharpness_score, limits);
+  Expect(good.accepted,
+         "intrinsic admission must pass using only visual and image-time observables");
+
+  auto marker_failure = sample;
+  marker_failure.used_markers = limits.minimum_markers - 1;
+  Expect(std::string_view(VisionCaptureSampling::EvaluateIntrinsicObservation(
+                              marker_failure, none, 0, 100.0, limits)
+                              .reason) == "marker_count",
+         "insufficient marker count must fail intrinsic admission");
+
+  auto homography_failure = sample;
+  homography_failure.homography_rms = limits.max_homography_rms + 0.1;
+  Expect(std::string_view(VisionCaptureSampling::EvaluateIntrinsicObservation(
+                              homography_failure, none, 0, 100.0, limits)
+                              .reason) == "homography_rms",
+         "high homography RMS must fail intrinsic admission");
+
+  auto sharpness_failure = sample;
+  sharpness_failure.sharpness_score = limits.min_sharpness_score - 1.0;
+  Expect(std::string_view(VisionCaptureSampling::EvaluateIntrinsicObservation(
+                              sharpness_failure, none, 0, 100.0, limits)
+                              .reason) == "sharpness",
+         "blurred views must fail intrinsic admission");
+
+  const std::array<VisionCaptureSampling::VisualSample, 1> accepted{sample};
+  auto interval_failure = sample;
+  interval_failure.image_timestamp_us =
+      sample.image_timestamp_us + limits.minimum_interval_us - 1U;
+  Expect(std::string_view(
+             VisionCaptureSampling::EvaluateIntrinsicObservation(
+                 interval_failure, accepted, sample.image_timestamp_us, 100.0, limits)
+                 .reason) == "accept_interval",
+         "too-close image timestamps must fail intrinsic admission");
+
+  auto duplicate_failure = sample;
+  duplicate_failure.image_timestamp_us =
+      sample.image_timestamp_us + limits.minimum_interval_us;
+  Expect(std::string_view(
+             VisionCaptureSampling::EvaluateIntrinsicObservation(
+                 duplicate_failure, accepted, sample.image_timestamp_us, 100.0, limits)
+                 .reason) == "duplicate_visual",
+         "visually duplicate views must fail intrinsic admission");
+
+  auto moved = duplicate_failure;
+  moved.center_x_norm += limits.min_center_delta_norm * 2.0;
+  Expect(VisionCaptureSampling::EvaluateIntrinsicObservation(
+             moved, accepted, sample.image_timestamp_us, 100.0, limits)
+             .accepted,
+         "a sufficient visual change must admit the next intrinsic view");
+
+  auto forced_duplicate = duplicate_failure;
+  forced_duplicate.image_timestamp_us = sample.image_timestamp_us + 1U;
+  const auto forced = VisionCaptureSampling::EvaluateIntrinsicObservation(
+      forced_duplicate, accepted, sample.image_timestamp_us, 100.0, limits, true);
+  Expect(forced.accepted && std::string_view(forced.reason) == "snapshot",
+         "snapshot may bypass interval and visual duplicate gates");
+
+  auto non_monotonic_snapshot = sample;
+  non_monotonic_snapshot.image_timestamp_us = sample.image_timestamp_us;
+  Expect(std::string_view(VisionCaptureSampling::EvaluateIntrinsicObservation(
+                              non_monotonic_snapshot, accepted, sample.image_timestamp_us,
+                              100.0, limits, true)
+                              .reason) == "image_timestamp_non_monotonic",
+         "snapshot must not bypass monotonic image timestamps");
+}
+
+void TestImuContract()
+{
+  const std::array<float, 4> quaternion{1.0F, 0.0F, 0.0F, 0.0F};
+  const std::array<float, 3> gyro{0.0F, 0.0F, 0.0F};
+  const std::array<float, 3> acceleration{0.0F, 0.0F, 9.80665F};
+  Expect(VisionCaptureSampling::ImuSampleUsable(1, quaternion, gyro, acceleration),
+         "finite nonzero-timestamp m/s2 IMU data must be usable");
+  Expect(!VisionCaptureSampling::ImuSampleUsable(0, quaternion, gyro, acceleration),
+         "zero IMU timestamp must fail closed");
+
+  auto zero_quaternion = quaternion;
+  zero_quaternion.fill(0.0F);
+  Expect(!VisionCaptureSampling::ImuSampleUsable(1, zero_quaternion, gyro, acceleration),
+         "zero quaternion must fail closed");
+
+  auto nan_gyro = gyro;
+  nan_gyro[1] = std::numeric_limits<float>::quiet_NaN();
+  Expect(!VisionCaptureSampling::ImuSampleUsable(1, quaternion, nan_gyro, acceleration),
+         "non-finite gyro must fail closed");
+
+  auto infinite_acceleration = acceleration;
+  infinite_acceleration[2] = std::numeric_limits<float>::infinity();
+  Expect(
+      !VisionCaptureSampling::ImuSampleUsable(1, quaternion, gyro, infinite_acceleration),
+      "non-finite acceleration must fail closed");
+
+  const double norm = VisionCaptureSampling::AccelerationNormMps2(acceleration);
+  Expect(std::abs(norm - VisionCaptureSampling::kStandardGravityMps2) < 1.0e-5,
+         "CameraBase acceleration must be interpreted directly as m/s2");
+  const std::array<float, 3> wrong_g_units{0.0F, 0.0F, 1.0F};
+  const auto wrong_unit_gate = VisionCaptureSampling::EvaluateHandEyeAbsoluteImu(
+      0.0, VisionCaptureSampling::AccelerationNormMps2(wrong_g_units), 2.0, 1.5);
+  Expect(!wrong_unit_gate.accepted &&
+             std::string_view(wrong_unit_gate.reason) == "acc_unit_or_scale",
+         "historical approximately-one-g-unit input must fail immediately");
+  const auto moving_gate =
+      VisionCaptureSampling::EvaluateHandEyeAbsoluteImu(2.1, norm, 2.0, 1.5);
+  Expect(!moving_gate.accepted && std::string_view(moving_gate.reason) == "gyro_moving",
+         "absolute gyro motion must fail before the stability window");
+}
+
+void TestIntrinsicConstructionAndSolveClaim()
+{
+  CameraTypes::CameraCalibration dimensions_only{};
+  dimensions_only.native_width = 1440;
+  dimensions_only.native_height = 1080;
+  Expect(VisionCaptureSampling::NativeSensorSizeUsable(dimensions_only),
+         "intrinsic solver must accept native dimensions without old K/D");
+  VisionCaptureCameraCalibration<kFullNativeLayout> calibration(dimensions_only);
+  (void)calibration;
+
+  using VisionCaptureCalibrationQuality::DecideSolveClaim;
+  using VisionCaptureCalibrationQuality::SolveClaimAction;
+  Expect(DecideSolveClaim(true, false, false) == SolveClaimAction::CLAIM,
+         "one active caller must claim solve ownership");
+  Expect(DecideSolveClaim(false, false, true) == SolveClaimAction::WAIT,
+         "a concurrent save must wait for the current solver");
+  Expect(DecideSolveClaim(false, true, false) == SolveClaimAction::RETURN_SUCCESS,
+         "a completed save must be idempotently successful");
+  Expect(DecideSolveClaim(false, false, false) == SolveClaimAction::RETURN_FAILURE,
+         "an inactive failed solve must not start a second writer");
+}
+
+void TestFrameProfiles()
+{
+  using VisionCaptureSampling::ClassifyFrameProfile;
+  using VisionCaptureSampling::FrameProfile;
+
+  const CameraTypes::FrameGeometry full{
+      1440, 1080, 4320, 0, 0, 1, 1, CameraTypes::FRAME_GEOMETRY_NONE, 0, 0.0F, 0.0F};
+  const CameraTypes::FrameGeometry wide{
+      720, 540, 2160, 0, 0, 2, 2, CameraTypes::FRAME_GEOMETRY_NONE, 0, 0.5F, 0.5F};
+  const CameraTypes::FrameGeometry narrow{
+      720, 540, 2160, 360, 270, 1, 1, CameraTypes::FRAME_GEOMETRY_NONE, 0, 0.0F, 0.0F};
+  auto reversed_wide = wide;
+  reversed_wide.flags =
+      CameraTypes::FRAME_GEOMETRY_REVERSE_X | CameraTypes::FRAME_GEOMETRY_REVERSE_Y;
+  auto reversed_narrow = narrow;
+  reversed_narrow.flags = CameraTypes::FRAME_GEOMETRY_REVERSE_X;
+  auto unknown = narrow;
+  unknown.roi_offset_x_native = 100;
+
+  Expect(ClassifyFrameProfile(1440, 1080, full) == FrameProfile::FULL_NATIVE,
+         "full native geometry must be classified");
+  Expect(ClassifyFrameProfile(1440, 1080, wide) == FrameProfile::WIDE &&
+             ClassifyFrameProfile(1440, 1080, reversed_wide) == FrameProfile::WIDE,
+         "wide profile classification must preserve reversal flags");
+  Expect(ClassifyFrameProfile(1440, 1080, narrow) == FrameProfile::NARROW &&
+             ClassifyFrameProfile(1440, 1080, reversed_narrow) == FrameProfile::NARROW,
+         "narrow profile classification must preserve reversal flags");
+  Expect(ClassifyFrameProfile(1440, 1080, unknown) == FrameProfile::UNKNOWN,
+         "off-center unsupported ROI must be unknown");
+}
+
+void TestCalibrationQualityGate()
+{
+  const std::array<double, 8> good_rms{0.8, 0.9, 1.0, 1.1, 0.7, 0.8, 0.9, 1.0};
+  VisionCaptureCalibrationQuality::Limits limits;
+  limits.minimum_views = good_rms.size();
+  const VisionCaptureCalibrationQuality::Coverage good_coverage{0.40, 0.35, 1.7};
+  const auto good = VisionCaptureCalibrationQuality::Evaluate(
+      good_rms.size(), true, 0.95, good_rms, good_coverage, limits);
+  Expect(good.views_ok && good.intrinsics_ok && good.reprojection_ok &&
+             good.coverage_ok && good.quality_ok,
+         "valid calibration quality must pass");
+
+  const auto global_rms_failure = VisionCaptureCalibrationQuality::Evaluate(
+      good_rms.size(), true, limits.max_global_reprojection_rms + 0.1, good_rms,
+      good_coverage, limits);
+  Expect(!global_rms_failure.reprojection_ok && !global_rms_failure.quality_ok,
+         "high global RMS must fail the calibration quality gate");
+
+  const VisionCaptureCalibrationQuality::Coverage poor_coverage{0.10, 0.10, 1.1};
+  const auto coverage_failure = VisionCaptureCalibrationQuality::Evaluate(
+      good_rms.size(), true, 0.95, good_rms, poor_coverage, limits);
+  Expect(!coverage_failure.coverage_ok && !coverage_failure.quality_ok,
+         "insufficient center and scale coverage must fail calibration quality");
+
+  const auto view_failure = VisionCaptureCalibrationQuality::Evaluate(
+      good_rms.size() - 1U, true, 0.95,
+      std::span<const double>(good_rms).first(good_rms.size() - 1U), good_coverage,
+      limits);
+  Expect(!view_failure.views_ok && !view_failure.quality_ok,
+         "insufficient views must fail the calibration quality gate");
+}
+
+void TestMixedProfileGeometryCsv()
+{
+  const CameraTypes::FrameGeometry wide{
+      720, 540, 2160, 0, 0, 2, 2, CameraTypes::FRAME_GEOMETRY_NONE, 0, 0.5F, 0.5F};
+  const CameraTypes::FrameGeometry narrow_reverse{
+      720,  540,
+      2160, 360,
+      270,  1,
+      1,    CameraTypes::FRAME_GEOMETRY_REVERSE_X | CameraTypes::FRAME_GEOMETRY_REVERSE_Y,
+      0,    0.25F,
+      0.75F};
+
+  std::ostringstream csv;
+  VisionCaptureRecording::WriteFrameGeometryHeader(csv);
+  VisionCaptureRecording::WriteFrameGeometryRow(csv, 1, "frames/wide.bmp", wide);
+  VisionCaptureRecording::WriteFrameGeometryRow(csv, 2, "frames/narrow,reverse.bmp",
+                                                narrow_reverse);
+
+  const std::string expected =
+      "frame_id,image_path,width,height,step,roi_offset_x_native,"
+      "roi_offset_y_native,decimation_x,decimation_y,flags,reserved,"
+      "sample_phase_x_native,sample_phase_y_native\n"
+      "1,frames/wide.bmp,720,540,2160,0,0,2,2,0,0,0.5,0.5\n"
+      "2,\"frames/narrow,reverse.bmp\",720,540,2160,360,270,1,1,3,0,0.25,0.75\n";
+  Expect(csv.str() == expected,
+         "WIDE, NARROW, and reversed geometry must round-trip per recorded frame");
+
+  CameraTypes::FrameGeometry precise_phase = wide;
+  precise_phase.sample_phase_x_native = std::nextafter(0.1F, 1.0F);
+  precise_phase.sample_phase_y_native = std::nextafter(0.9F, 0.0F);
+  std::ostringstream precise_row;
+  VisionCaptureRecording::WriteFrameGeometryRow(precise_row, 3, "phase.bmp",
+                                                precise_phase);
+  const std::string serialized = precise_row.str();
+  const std::size_t last_comma = serialized.rfind(',');
+  const std::size_t previous_comma = serialized.rfind(',', last_comma - 1U);
+  Expect(last_comma != std::string::npos && previous_comma != std::string::npos,
+         "geometry row must contain both sample phase fields");
+  const float phase_x =
+      std::stof(serialized.substr(previous_comma + 1U, last_comma - previous_comma - 1U));
+  const float phase_y = std::stof(serialized.substr(last_comma + 1U));
+  Expect(phase_x == precise_phase.sample_phase_x_native &&
+             phase_y == precise_phase.sample_phase_y_native,
+         "sample phases must survive CSV serialization exactly");
+}
+
+void TestRecordOptionsAndCheckedWrite()
+{
+  const std::array<float, 4> rotation{1.0F, 0.0F, 0.0F, 0.0F};
+  const std::array<float, 3> angular_velocity{1.0F, 2.0F, 3.0F};
+  const std::array<float, 3> acceleration{4.0F, 5.0F, 6.0F};
+
+  std::ostringstream disabled;
+  VisionCaptureRecording::WriteRawImuCells(disabled, false, rotation, angular_velocity,
+                                           acceleration);
+  Expect(disabled.str() == ",,,,,,,,,,",
+         "save_raw_imu=false must retain ten empty CSV cells");
+
+  std::ostringstream enabled;
+  VisionCaptureRecording::WriteRawImuCells(enabled, true, rotation, angular_velocity,
+                                           acceleration);
+  Expect(enabled.str() == ",1,0,0,0,1,2,3,4,5,6",
+         "save_raw_imu=true must write all ten raw IMU values");
+
+  Expect(!VisionCaptureRecording::ShouldFlush(1, 3),
+         "flush_every_n must not flush early");
+  Expect(VisionCaptureRecording::ShouldFlush(3, 3),
+         "flush_every_n must flush on the configured interval");
+  Expect(!VisionCaptureRecording::ShouldFlush(3, 0),
+         "flush_every_n=0 must disable periodic flushes");
+
+  const std::string unique =
+      "vision_capture_checked_write_" +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::filesystem::path root = std::filesystem::temp_directory_path() / unique;
+  Expect(std::filesystem::create_directory(root),
+         "checked-write test directory must be created");
+  const std::filesystem::path output = root / "output.txt";
+  const std::string content{"calibration\nreadback\n"};
+  Expect(VisionCaptureRecording::WriteTextFile(output, content),
+         "checked text output must write and read back successfully");
+  std::ifstream in(output, std::ios::binary);
+  const std::string readback((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+  Expect(readback == content, "checked text output must preserve exact bytes");
+  Expect(!VisionCaptureRecording::WriteTextFile(root, content),
+         "writing text to an existing directory must fail");
+  Expect(std::filesystem::remove(output), "checked-write output must be removable");
+  Expect(std::filesystem::remove(root), "checked-write directory must be removable");
+}
 }  // namespace
 
 int main()
@@ -79,5 +438,13 @@ int main()
   TestResidualHandlesAnisotropicReversal();
   TestWeightedGlobalRms();
   TestGeneratedLayoutName();
+  TestDatasetModePolicy();
+  TestIntrinsicVisualAdmission();
+  TestImuContract();
+  TestIntrinsicConstructionAndSolveClaim();
+  TestFrameProfiles();
+  TestCalibrationQualityGate();
+  TestMixedProfileGeometryCsv();
+  TestRecordOptionsAndCheckedWrite();
   return 0;
 }

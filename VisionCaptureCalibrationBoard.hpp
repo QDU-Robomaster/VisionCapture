@@ -4,12 +4,11 @@
 #include <array>
 #include <cmath>
 #include <map>
-#include <vector>
-
 #include <opencv2/aruco.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <vector>
 
 namespace VisionCaptureCalibrationBoard
 {
@@ -40,6 +39,8 @@ struct Observation
   std::vector<cv::Point3f> object_points;
   /// 与 object_points 一一对应的图像角点。
   std::vector<cv::Point2f> image_points;
+  /// 平面单应性对 object_points 的帧坐标重投影，用于内参采样预览。
+  std::vector<cv::Point2f> homography_projected_points;
   /// OpenCV ArUco 检测出的原始 marker 角点。
   std::vector<std::vector<cv::Point2f>> marker_corners;
   /// 检测出的 marker id 列表。
@@ -66,10 +67,7 @@ struct PoseEstimate
 /**
  * @brief 将浮点数限制到三角函数反解可接受的 [-1, 1]。
  */
-inline double ClampUnit(double value)
-{
-  return std::max(-1.0, std::min(1.0, value));
-}
+inline double ClampUnit(double value) { return std::max(-1.0, std::min(1.0, value)); }
 
 /**
  * @brief 归一化标定板在图像中的平面内角度。
@@ -129,8 +127,13 @@ inline cv::Mat MakeGrayImage(const cv::Mat& image)
  * @brief 用平面单应性估计当前角点集合的重投影 RMS。
  */
 inline double HomographyRms(const std::vector<cv::Point3f>& object_points,
-                            const std::vector<cv::Point2f>& image_points)
+                            const std::vector<cv::Point2f>& image_points,
+                            std::vector<cv::Point2f>* projected_points = nullptr)
 {
+  if (projected_points != nullptr)
+  {
+    projected_points->clear();
+  }
   if (object_points.size() < 4 || object_points.size() != image_points.size())
   {
     return 1e9;
@@ -151,6 +154,10 @@ inline double HomographyRms(const std::vector<cv::Point3f>& object_points,
 
   std::vector<cv::Point2f> projected;
   cv::perspectiveTransform(object_xy, projected, homography);
+  if (projected_points != nullptr)
+  {
+    *projected_points = projected;
+  }
 
   double sum2 = 0.0;
   for (std::size_t i = 0; i < image_points.size(); ++i)
@@ -164,8 +171,8 @@ inline double HomographyRms(const std::vector<cv::Point3f>& object_points,
 /**
  * @brief 计算 marker 区域的拉普拉斯方差。
  */
-inline double MarkerSharpnessScore(
-    const cv::Mat& image, const std::vector<std::vector<cv::Point2f>>& corners)
+inline double MarkerSharpnessScore(const cv::Mat& image,
+                                   const std::vector<std::vector<cv::Point2f>>& corners)
 {
   const cv::Mat gray = MakeGrayImage(image);
   if (gray.empty())
@@ -212,8 +219,7 @@ inline double MarkerSharpnessScore(
 inline void FillQuality(const cv::Mat& image, uint32_t width, uint32_t height,
                         Observation& observation)
 {
-  observation.sharpness_score =
-      MarkerSharpnessScore(image, observation.marker_corners);
+  observation.sharpness_score = MarkerSharpnessScore(image, observation.marker_corners);
 
   if (observation.image_points.empty() || width == 0 || height == 0)
   {
@@ -229,9 +235,8 @@ inline void FillQuality(const cv::Mat& image, uint32_t width, uint32_t height,
   observation.center_y_norm =
       (static_cast<double>(bounds.y) + static_cast<double>(bounds.height) * 0.5) /
       image_height;
-  observation.scale_norm =
-      std::sqrt(std::max(0.0, static_cast<double>(bounds.area())) /
-                std::max(1.0, image_width * image_height));
+  observation.scale_norm = std::sqrt(std::max(0.0, static_cast<double>(bounds.area())) /
+                                     std::max(1.0, image_width * image_height));
 
   if (observation.image_points.size() >= 4)
   {
@@ -243,9 +248,9 @@ inline void FillQuality(const cv::Mat& image, uint32_t width, uint32_t height,
 /**
  * @brief 按 marker id 将检测角点整理成 OpenCV 标定所需点列。
  */
-inline bool CollectBoardPoints(
-    const std::vector<std::vector<cv::Point2f>>& corners, const cv::Mat& ids,
-    const BoardMap& board, Observation& observation)
+inline bool CollectBoardPoints(const std::vector<std::vector<cv::Point2f>>& corners,
+                               const cv::Mat& ids, const BoardMap& board,
+                               Observation& observation)
 {
   observation.object_points.clear();
   observation.image_points.clear();
@@ -287,10 +292,8 @@ inline BoardMap MakeSingleArucoBoard(double marker_length_m)
 {
   const float half = static_cast<float>(marker_length_m * 0.5);
   BoardMap board;
-  board[0] = {cv::Point3f{-half, half, 0.0F},
-              cv::Point3f{half, half, 0.0F},
-              cv::Point3f{half, -half, 0.0F},
-              cv::Point3f{-half, -half, 0.0F}};
+  board[0] = {cv::Point3f{-half, half, 0.0F}, cv::Point3f{half, half, 0.0F},
+              cv::Point3f{half, -half, 0.0F}, cv::Point3f{-half, -half, 0.0F}};
   return board;
 }
 
@@ -318,10 +321,8 @@ inline BoardMap MakeGShangBoard(double marker_mm, int cols, int rows,
       const float y0 = static_cast<float>(row * square_mm + marker_offset_mm);
       const float x1 = x0 + static_cast<float>(marker_mm);
       const float y1 = y0 + static_cast<float>(marker_mm);
-      board[marker_id++] = {cv::Point3f{x0, y0, 0.0F},
-                            cv::Point3f{x1, y0, 0.0F},
-                            cv::Point3f{x1, y1, 0.0F},
-                            cv::Point3f{x0, y1, 0.0F}};
+      board[marker_id++] = {cv::Point3f{x0, y0, 0.0F}, cv::Point3f{x1, y0, 0.0F},
+                            cv::Point3f{x1, y1, 0.0F}, cv::Point3f{x0, y1, 0.0F}};
     }
   }
   return board;
@@ -333,8 +334,7 @@ inline BoardMap MakeGShangBoard(double marker_mm, int cols, int rows,
 inline double ReprojectionRms(const std::vector<cv::Point3f>& object_points,
                               const std::vector<cv::Point2f>& image_points,
                               const cv::Mat& rvec, const cv::Mat& tvec,
-                              const cv::Mat& camera_matrix,
-                              const cv::Mat& distortion)
+                              const cv::Mat& camera_matrix, const cv::Mat& distortion)
 {
   std::vector<cv::Point2f> projected;
   cv::projectPoints(object_points, rvec, tvec, camera_matrix, distortion, projected);
@@ -351,8 +351,8 @@ inline double ReprojectionRms(const std::vector<cv::Point3f>& object_points,
  * @brief 对一帧标定板角点执行 solvePnP。
  */
 inline PoseEstimate EstimatePose(const Observation& observation,
-                                 const cv::Mat& camera_matrix,
-                                 const cv::Mat& distortion, int method)
+                                 const cv::Mat& camera_matrix, const cv::Mat& distortion,
+                                 int method)
 {
   PoseEstimate result;
   if (!observation.observed || observation.object_points.size() < 4 ||
@@ -360,16 +360,15 @@ inline PoseEstimate EstimatePose(const Observation& observation,
   {
     return result;
   }
-  if (!cv::solvePnP(observation.object_points, observation.image_points,
-                    camera_matrix, distortion, result.rvec, result.tvec, false,
-                    method))
+  if (!cv::solvePnP(observation.object_points, observation.image_points, camera_matrix,
+                    distortion, result.rvec, result.tvec, false, method))
   {
     return result;
   }
   result.ok = true;
   result.reprojection_rms_px =
-      ReprojectionRms(observation.object_points, observation.image_points,
-                      result.rvec, result.tvec, camera_matrix, distortion);
+      ReprojectionRms(observation.object_points, observation.image_points, result.rvec,
+                      result.tvec, camera_matrix, distortion);
   return result;
 }
 }  // namespace VisionCaptureCalibrationBoard
