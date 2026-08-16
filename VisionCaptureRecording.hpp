@@ -139,4 +139,13 @@ inline bool ShouldFlush(uint64_t rows_written, uint32_t flush_every_n)
 {
   return flush_every_n != 0U && rows_written != 0U && rows_written % flush_every_n == 0U;
 }
+
+/**
+ * @brief 标定视角只有在本帧所需记录完整持久化后才能提交给求解器。
+ */
+inline bool CalibrationViewMayCommit(bool sample_accepted, bool record_required,
+                                     bool record_completed, bool io_failed)
+{
+  return sample_accepted && !io_failed && (!record_required || record_completed);
+}
 }  // namespace VisionCaptureRecording

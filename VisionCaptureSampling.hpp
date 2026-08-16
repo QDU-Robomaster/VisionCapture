@@ -13,6 +13,26 @@
 
 namespace VisionCaptureSampling
 {
+/**
+ * @brief 请求代次大于已消费代次时，仍有 snapshot 等待有效样本。
+ */
+inline bool SnapshotPending(uint64_t request_generation, uint64_t consumed_generation)
+{
+  return request_generation > consumed_generation;
+}
+
+/**
+ * @brief 只有成功接受样本才消费本帧观察到的 snapshot 代次。
+ */
+inline uint64_t ConsumeSnapshotGeneration(uint64_t request_generation,
+                                          uint64_t consumed_generation,
+                                          bool sample_accepted)
+{
+  return sample_accepted && SnapshotPending(request_generation, consumed_generation)
+             ? request_generation
+             : consumed_generation;
+}
+
 inline constexpr double kStandardGravityMps2 = 9.80665;
 inline constexpr double kGShangMarkerSizeMm = 25.0;
 inline constexpr int kGShangColumns = 8;
@@ -31,7 +51,7 @@ enum class DatasetMode : uint8_t
 /**
  * @brief 按显式模式选择唯一的数据采样契约。
  *
- * `calibrate` 保留为 `calibrate_camera` 的兼容别名。手眼模式优先级最高，避免同时
+ * `calibrate` 是 `calibrate_camera` 的兼容别名。手眼模式优先级最高，避免同时
  * 运行内参求解和手眼数据采集。
  */
 inline DatasetMode ClassifyDatasetMode(std::string_view mode,

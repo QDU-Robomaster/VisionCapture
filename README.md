@@ -39,6 +39,15 @@
 表示仅在文件流关闭时刷盘，否则每成功记录指定行数后同时刷新两个 CSV。
 相机和 MCU 时间戳属于不同时间域，`samples.csv` 分别保留两者，旧 `dt_us` 列恒为空；
 原始加速度沿用 `CameraBase::ImuStamped` 的固定 `m/s^2` 契约并在末列明确记录单位。
+任一必需记录或 CSV 刷盘失败都会锁存会话失败、清空内参求解视角并阻止 `solve`
+返回 PASS；只有图像和元数据完整持久化后，该帧才会提交给内参求解器。
+
+同步 Topic 回调只 retain `SharedFrame` 并写入容量为 2 的 drop-oldest 队列，OpenCV、
+预览深拷贝和磁盘 I/O 全部在对象拥有的 worker 中执行，不反压 CameraFrameSync 发布
+线程。析构会停止并 join worker；由于 LibXR Topic 当前没有回调注销接口，调用方必须
+先停止上游发布再析构 `VisionCapture`。RGB8/RGBA8 输入会在 worker 内分别转换为
+OpenCV 的 BGR/BGRA 约定后再检测、预览和写图。worker 处理异常会关闭队列、释放
+待处理帧并锁存会话失败，不会让异常越过线程入口终止进程。
 
 ## 相机内参标定
 
@@ -67,7 +76,8 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 `MainFrameLayout` 与原生 `CameraCalibration` 片段。写入配置前应检查原生尺寸、焦距、
 主点、畸变系数和重投影 RMS 是否合理。离群阈值、`rms`、`views.csv` 和质量报告中的
 重投影误差均使用当前帧像素；`calibration.yml` 另存 `native_rms` 供原生坐标诊断。
-只有视角数、中心/尺度覆盖、内参合理性和全局/逐视角重投影误差全部通过
+只有视角数、中心/尺度覆盖、最终外参恢复出的双轴标定板倾斜跨度、内参合理性和
+全局/逐视角重投影误差全部通过
 `quality_ok`，且所有输出逐字节写后读回成功时，求解才返回成功并生成
 `calibration.yml` 与 `camera_info_snippet.txt`。质量失败仍保留
 `views.csv` 和 `quality_report.txt`，但不会打印 PASS 或生成可粘贴配置。
@@ -99,8 +109,8 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 
 - `start`：开始采样。
 - `pause` / `stop`：暂停采样。
-- `reset`：清空本轮采样状态。
-- `snapshot`：请求保存一帧。
+- `reset`：清空判稳窗口、已接受样本、求解器视角和完成状态。
+- `snapshot`：请求保存下一帧有效样本；被拒绝帧不会消费请求，并发新请求不会丢失。
 - `status`：打印当前采样状态。
 - `solve`：内参模式立即尝试求解；手眼模式只打印当前样本数。
 - `help`：打印命令列表。

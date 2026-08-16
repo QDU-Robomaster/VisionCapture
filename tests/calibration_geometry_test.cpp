@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -9,9 +10,12 @@
 #include <limits>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
+#include "VisionCapture.hpp"
 #include "VisionCaptureCalibrationGeometry.hpp"
 #include "VisionCaptureCalibrationQuality.hpp"
 #include "VisionCaptureCameraCalibration.hpp"
@@ -132,7 +136,8 @@ void TestDatasetModePolicy()
       "calibration modes must fail closed when sampling is disabled");
   Expect(VisionCaptureSampling::ShouldSaveRawImu(DatasetMode::HAND_EYE, false) &&
              !VisionCaptureSampling::ShouldSaveRawImu(DatasetMode::INTRINSIC, false),
-         "hand-eye must force raw IMU while intrinsic preserves the record option");
+         "hand-eye must force raw IMU while intrinsic preserves the record "
+         "option");
   Expect(VisionCaptureSampling::kGShangMarkerSizeMm == 25.0 &&
              VisionCaptureSampling::kGShangColumns == 8 &&
              VisionCaptureSampling::kGShangRows == 6 &&
@@ -149,7 +154,8 @@ void TestIntrinsicVisualAdmission()
   const auto good = VisionCaptureSampling::EvaluateIntrinsicObservation(
       sample, none, 0, sample.sharpness_score, limits);
   Expect(good.accepted,
-         "intrinsic admission must pass using only visual and image-time observables");
+         "intrinsic admission must pass using only visual and "
+         "image-time observables");
 
   auto marker_failure = sample;
   marker_failure.used_markers = limits.minimum_markers - 1;
@@ -212,6 +218,111 @@ void TestIntrinsicVisualAdmission()
                               100.0, limits, true)
                               .reason) == "image_timestamp_non_monotonic",
          "snapshot must not bypass monotonic image timestamps");
+}
+
+void TestSnapshotGenerationConsumption()
+{
+  Expect(VisionCaptureSampling::SnapshotPending(2U, 1U),
+         "new snapshot generation must remain pending");
+  Expect(VisionCaptureSampling::ConsumeSnapshotGeneration(2U, 1U, false) == 1U,
+         "a rejected frame must not consume snapshot generation");
+  Expect(VisionCaptureSampling::ConsumeSnapshotGeneration(2U, 1U, true) == 2U,
+         "an accepted frame must consume exactly the generation it observed");
+  const uint64_t consumed =
+      VisionCaptureSampling::ConsumeSnapshotGeneration(2U, 1U, true);
+  Expect(VisionCaptureSampling::SnapshotPending(3U, consumed),
+         "a request racing after an observed generation must remain for the "
+         "next frame");
+}
+
+void TestDropOldestWorkerLifecycle()
+{
+  VisionCaptureDetail::DropOldestWorkerQueue<int, 2> queue;
+  std::atomic<bool> first_started{false};
+  std::atomic<bool> release_first{false};
+  std::atomic<uint32_t> processed{0};
+  queue.Start(
+      [&](int value)
+      {
+        if (value == 1)
+        {
+          first_started.store(true, std::memory_order_release);
+          while (!release_first.load(std::memory_order_acquire))
+          {
+            std::this_thread::yield();
+          }
+        }
+        processed.fetch_add(1, std::memory_order_acq_rel);
+      });
+  Expect(queue.Enqueue(1), "running worker queue must accept the first item");
+  const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!first_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < start_deadline)
+  {
+    std::this_thread::yield();
+  }
+  Expect(first_started.load(std::memory_order_acquire),
+         "worker must begin processing the first item");
+  Expect(queue.Enqueue(2) && queue.Enqueue(3) && queue.Enqueue(4),
+         "running queue must accept bounded pending items");
+  Expect(queue.TakeDroppedCount() == 1U,
+         "third pending item must drop exactly the oldest queued item");
+  release_first.store(true, std::memory_order_release);
+  const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (processed.load(std::memory_order_acquire) != 3U &&
+         std::chrono::steady_clock::now() < drain_deadline)
+  {
+    std::this_thread::yield();
+  }
+  Expect(processed.load(std::memory_order_acquire) == 3U,
+         "worker must process the active item and two retained newest items");
+  queue.Stop();
+  Expect(!queue.Enqueue(5), "stopped worker queue must reject enqueue");
+
+  queue.Start([&](int) { processed.fetch_add(1, std::memory_order_acq_rel); });
+  Expect(queue.Enqueue(6), "worker queue must support a clean restart");
+  const auto restart_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (processed.load(std::memory_order_acquire) != 4U &&
+         std::chrono::steady_clock::now() < restart_deadline)
+  {
+    std::this_thread::yield();
+  }
+  queue.Stop();
+  Expect(processed.load(std::memory_order_acquire) == 4U,
+         "restarted worker must process and join cleanly");
+}
+
+void TestWorkerExceptionStopsQueue()
+{
+  VisionCaptureDetail::DropOldestWorkerQueue<int, 2> queue;
+  std::atomic<bool> failure_reported{false};
+  queue.Start([](int) { throw std::runtime_error("injected worker failure"); },
+              [&](std::exception_ptr error)
+              {
+                try
+                {
+                  std::rethrow_exception(error);
+                }
+                catch (const std::runtime_error& exception)
+                {
+                  failure_reported.store(
+                      std::string_view(exception.what()) == "injected worker failure",
+                      std::memory_order_release);
+                }
+              });
+  Expect(queue.Enqueue(1), "worker queue must accept the injected failure item");
+  const auto failure_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((queue.Accepting() || !failure_reported.load(std::memory_order_acquire)) &&
+         std::chrono::steady_clock::now() < failure_deadline)
+  {
+    std::this_thread::yield();
+  }
+  Expect(!queue.Accepting() && failure_reported.load(std::memory_order_acquire),
+         "worker exception must stop admission and report the failure");
+  Expect(!queue.Enqueue(2), "failed worker queue must reject later items");
+  queue.Stop();
 }
 
 void TestImuContract()
@@ -277,6 +388,39 @@ void TestIntrinsicConstructionAndSolveClaim()
          "an inactive failed solve must not start a second writer");
 }
 
+void TestCalibrationResetAndAbortState()
+{
+  CameraTypes::CameraCalibration dimensions_only{};
+  dimensions_only.native_width = 1440;
+  dimensions_only.native_height = 1080;
+  VisionCaptureCameraCalibration<kFullNativeLayout> calibration(dimensions_only);
+
+  const std::string unique =
+      "vision_capture_reset_" +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::filesystem::path root = std::filesystem::temp_directory_path() / unique;
+  Expect(std::filesystem::create_directory(root), "reset test directory must be created");
+  const std::filesystem::path previous = std::filesystem::current_path();
+  std::filesystem::current_path(root);
+  Expect(calibration.Start("25mm", 8, 6, "reset-test"),
+         "calibration reset test session must start");
+  Expect(calibration.Reset() && calibration.AcceptedViewCount() == 0U &&
+             !calibration.Finished(),
+         "reset must clear solver views and derived completion state");
+
+  const CameraTypes::FrameGeometry geometry{
+      1440, 1080, 4320, 0, 0, 1, 1, CameraTypes::FRAME_GEOMETRY_NONE, 0, 0.0F, 0.0F};
+  Expect(calibration.ProcessFrame(nullptr, geometry, 1U),
+         "reset must leave the calibration sampler active");
+  calibration.AbortAndClear();
+  Expect(!calibration.ProcessFrame(nullptr, geometry, 2U) &&
+             calibration.AcceptedViewCount() == 0U && !calibration.Finished(),
+         "record abort must clear views and stop solver admission");
+  std::filesystem::current_path(previous);
+  Expect(std::filesystem::remove_all(root) != 0U,
+         "reset test directory must be removable");
+}
+
 void TestFrameProfiles()
 {
   using VisionCaptureSampling::ClassifyFrameProfile;
@@ -311,14 +455,32 @@ void TestFrameProfiles()
 void TestCalibrationQualityGate()
 {
   const std::array<double, 8> good_rms{0.8, 0.9, 1.0, 1.1, 0.7, 0.8, 0.9, 1.0};
+  const std::array<VisionCaptureCalibrationQuality::BoardNormal, 8> good_normals{
+      {{-0.25, -0.20, 1.0},
+       {-0.20, 0.20, 1.0},
+       {0.25, -0.20, 1.0},
+       {0.20, 0.20, 1.0},
+       {-0.30, -0.12, 1.0},
+       {0.30, 0.12, 1.0},
+       {-0.12, 0.25, 1.0},
+       {0.12, -0.25, 1.0}}};
+  const auto good_pose =
+      VisionCaptureCalibrationQuality::ComputeTiltCoverage(good_normals);
   VisionCaptureCalibrationQuality::Limits limits;
   limits.minimum_views = good_rms.size();
-  const VisionCaptureCalibrationQuality::Coverage good_coverage{0.40, 0.35, 1.7};
+  const VisionCaptureCalibrationQuality::Coverage good_coverage{
+      .center_span_x = 0.40,
+      .center_span_y = 0.35,
+      .scale_ratio = 1.7,
+      .pose_views = good_pose.pose_views,
+      .tilt_span_x_deg = good_pose.tilt_span_x_deg,
+      .tilt_span_y_deg = good_pose.tilt_span_y_deg,
+  };
   const auto good = VisionCaptureCalibrationQuality::Evaluate(
       good_rms.size(), true, 0.95, good_rms, good_coverage, limits);
   Expect(good.views_ok && good.intrinsics_ok && good.reprojection_ok &&
-             good.coverage_ok && good.quality_ok,
-         "valid calibration quality must pass");
+             good.coverage_ok && good.pose_ok && good.quality_ok,
+         "well-distributed centers, scales, and board tilts must pass");
 
   const auto global_rms_failure = VisionCaptureCalibrationQuality::Evaluate(
       good_rms.size(), true, limits.max_global_reprojection_rms + 0.1, good_rms,
@@ -326,11 +488,28 @@ void TestCalibrationQualityGate()
   Expect(!global_rms_failure.reprojection_ok && !global_rms_failure.quality_ok,
          "high global RMS must fail the calibration quality gate");
 
-  const VisionCaptureCalibrationQuality::Coverage poor_coverage{0.10, 0.10, 1.1};
+  auto poor_coverage = good_coverage;
+  poor_coverage.center_span_x = 0.10;
+  poor_coverage.center_span_y = 0.10;
+  poor_coverage.scale_ratio = 1.1;
   const auto coverage_failure = VisionCaptureCalibrationQuality::Evaluate(
       good_rms.size(), true, 0.95, good_rms, poor_coverage, limits);
   Expect(!coverage_failure.coverage_ok && !coverage_failure.quality_ok,
          "insufficient center and scale coverage must fail calibration quality");
+
+  std::array<VisionCaptureCalibrationQuality::BoardNormal, 8> degenerate_normals{};
+  degenerate_normals.fill({0.01, -0.01, 1.0});
+  const auto degenerate_pose =
+      VisionCaptureCalibrationQuality::ComputeTiltCoverage(degenerate_normals);
+  auto degenerate_coverage = good_coverage;
+  degenerate_coverage.pose_views = degenerate_pose.pose_views;
+  degenerate_coverage.tilt_span_x_deg = degenerate_pose.tilt_span_x_deg;
+  degenerate_coverage.tilt_span_y_deg = degenerate_pose.tilt_span_y_deg;
+  const auto pose_failure = VisionCaptureCalibrationQuality::Evaluate(
+      good_rms.size(), true, 0.95, good_rms, degenerate_coverage, limits);
+  Expect(pose_failure.coverage_ok && !pose_failure.pose_ok && !pose_failure.quality_ok,
+         "fronto-parallel views must fail even with good center, scale, and "
+         "RMS metrics");
 
   const auto view_failure = VisionCaptureCalibrationQuality::Evaluate(
       good_rms.size() - 1U, true, 0.95,
@@ -363,7 +542,8 @@ void TestMixedProfileGeometryCsv()
       "roi_offset_y_native,decimation_x,decimation_y,flags,reserved,"
       "sample_phase_x_native,sample_phase_y_native\n"
       "1,frames/wide.bmp,720,540,2160,0,0,2,2,0,0,0.5,0.5\n"
-      "2,\"frames/narrow,reverse.bmp\",720,540,2160,360,270,1,1,3,0,0.25,0.75\n";
+      "2,\"frames/"
+      "narrow,reverse.bmp\",720,540,2160,360,270,1,1,3,0,0.25,0.75\n";
   Expect(csv.str() == expected,
          "WIDE, NARROW, and reversed geometry must round-trip per recorded frame");
 
@@ -410,6 +590,13 @@ void TestRecordOptionsAndCheckedWrite()
          "flush_every_n must flush on the configured interval");
   Expect(!VisionCaptureRecording::ShouldFlush(3, 0),
          "flush_every_n=0 must disable periodic flushes");
+  Expect(VisionCaptureRecording::CalibrationViewMayCommit(true, true, true, false),
+         "persisted accepted samples may enter the solver");
+  Expect(!VisionCaptureRecording::CalibrationViewMayCommit(true, true, false, false) &&
+             !VisionCaptureRecording::CalibrationViewMayCommit(true, true, true, true),
+         "unpersisted or failed records must not enter the solver");
+  Expect(VisionCaptureRecording::CalibrationViewMayCommit(true, false, false, false),
+         "non-recording calibration paths must not require a persistence receipt");
 
   const std::string unique =
       "vision_capture_checked_write_" +
@@ -440,8 +627,12 @@ int main()
   TestGeneratedLayoutName();
   TestDatasetModePolicy();
   TestIntrinsicVisualAdmission();
+  TestSnapshotGenerationConsumption();
+  TestDropOldestWorkerLifecycle();
+  TestWorkerExceptionStopsQueue();
   TestImuContract();
   TestIntrinsicConstructionAndSolveClaim();
+  TestCalibrationResetAndAbortState();
   TestFrameProfiles();
   TestCalibrationQualityGate();
   TestMixedProfileGeometryCsv();
