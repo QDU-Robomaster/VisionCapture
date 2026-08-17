@@ -85,7 +85,6 @@ depends:
 #include <fstream>
 #include <functional>
 #include <iomanip>
-#include <iostream>
 #include <limits>
 #include <mutex>
 #include <opencv2/aruco.hpp>
@@ -104,6 +103,7 @@ depends:
 #include "CameraFrameSync.hpp"
 #include "VisionCaptureCalibrationBoard.hpp"
 #include "VisionCaptureCameraCalibration.hpp"
+#include "VisionCaptureControlInput.hpp"
 #include "VisionCaptureRecording.hpp"
 #include "VisionCaptureSampling.hpp"
 #include "VisionPreview.hpp"
@@ -113,9 +113,6 @@ depends:
 
 namespace VisionCaptureDetail
 {
-/// 标准输入命令线程栈大小。
-inline constexpr size_t kControlStackSize = 4096;
-
 /**
  * @brief 有界 drop-oldest 队列及其拥有的单消费 worker。
  */
@@ -729,22 +726,18 @@ class VisionCapture : public LibXR::Application
                        { HandleFrameProcessingFailure(error); });
     synced_frame_topic_.RegisterCallback(synced_frame_callback_);
     XR_LOG_INFO("VisionCapture subscribed: topic=%s", sync->SyncedFrameTopicName());
-    if (cfg_.control.stdin_enabled)
-    {
-      control_thread_.Create(this, ControlThreadFun, "VisionCapCtl",
-                             VisionCaptureDetail::kControlStackSize,
-                             LibXR::Thread::Priority::LOW);
-    }
     app.Register(*this);
+    StartControlInputIfNeeded();
   }
 
   /**
-   * @brief 停止帧处理 worker 并释放队列中 retain 的 SharedFrame。
+   * @brief 停止控制输入和帧处理 worker，并释放队列中 retain 的 SharedFrame。
    *
    * 上游必须已经停止发布；LibXR Topic 当前没有回调注销接口。
    */
   ~VisionCapture()
   {
+    control_input_.Stop();
     frame_queue_.Stop();
     preview_.Stop();
   }
@@ -794,19 +787,56 @@ class VisionCapture : public LibXR::Application
   }
 
   /**
-   * @brief 从标准输入读取采样控制命令。
+   * @brief 记录标准输入 worker 的异常退出原因。
    */
-  static void ControlThreadFun(VisionCapture* self)
+  static void LogControlInputFailure(std::exception_ptr error) noexcept
   {
-    XR_LOG_INFO(
-        "VisionCapture stdin control ready: "
-        "help/status/start/pause/reset/solve/snapshot");
-    std::string line;
-    while (std::getline(std::cin, line))
+    try
     {
-      self->HandleControlCommand(line);
+      if (error)
+      {
+        std::rethrow_exception(error);
+      }
     }
-    XR_LOG_INFO("VisionCapture stdin control stopped: stdin closed");
+    catch (const std::exception& exception)
+    {
+      XR_LOG_ERROR("VisionCapture stdin control stopped after error: %s",
+                   exception.what());
+    }
+    catch (...)
+    {
+      XR_LOG_ERROR("VisionCapture stdin control stopped after unknown error");
+    }
+  }
+
+  /**
+   * @brief 启动可取消的标准输入采样控制。
+   */
+  void StartControlInputIfNeeded() noexcept
+  {
+    if (!cfg_.control.stdin_enabled)
+    {
+      return;
+    }
+
+    try
+    {
+      const bool started = control_input_.StartStandardInput(
+          [this](std::string_view line) { HandleControlCommand(line); },
+          LogControlInputFailure);
+      if (!started)
+      {
+        XR_LOG_ERROR("VisionCapture failed to start stdin control");
+        return;
+      }
+      XR_LOG_INFO(
+          "VisionCapture stdin control ready: "
+          "help/status/start/pause/reset/solve/snapshot");
+    }
+    catch (...)
+    {
+      LogControlInputFailure(std::current_exception());
+    }
   }
 
   /**
@@ -2354,8 +2384,6 @@ class VisionCapture : public LibXR::Application
   LibXR::Topic::Callback synced_frame_callback_{};
   /// 回调 retain 后写入的双槽 drop-oldest worker 队列。
   VisionCaptureDetail::DropOldestWorkerQueue<SyncedFrame, 2> frame_queue_{};
-  /// 标准输入命令线程。
-  LibXR::Thread control_thread_{};
 
   /// OpenCV ArUco 字典。
   cv::aruco::Dictionary dictionary_{};
@@ -2440,4 +2468,6 @@ class VisionCapture : public LibXR::Application
   std::atomic<uint64_t> sampling_accepted_total_{0};
   /// monitor 周期内拒绝的标定样本数。
   std::atomic<uint64_t> sampling_rejected_{0};
+  /// 可取消并由析构等待的标准输入读取器；最后声明以便构造失败时优先析构。
+  VisionCaptureDetail::StoppableLineInput control_input_{};
 };

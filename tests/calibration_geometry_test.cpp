@@ -1,5 +1,6 @@
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -8,12 +9,18 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #include "VisionCapture.hpp"
 #include "VisionCaptureCalibrationGeometry.hpp"
@@ -44,6 +51,38 @@ void ExpectNear(double actual, double expected, const char* message)
     std::exit(1);
   }
 }
+
+template <typename Predicate>
+bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout)
+{
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate() && std::chrono::steady_clock::now() < deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return predicate();
+}
+
+#if !defined(_WIN32)
+bool WriteAll(int fd, std::string_view data)
+{
+  std::size_t written = 0;
+  while (written < data.size())
+  {
+    const ssize_t count = ::write(fd, data.data() + written, data.size() - written);
+    if (count < 0 && errno == EINTR)
+    {
+      continue;
+    }
+    if (count <= 0)
+    {
+      return false;
+    }
+    written += static_cast<std::size_t>(count);
+  }
+  return true;
+}
+#endif
 
 CameraTypes::FrameGeometry MakeGeometry(uint16_t decimation_x, uint16_t decimation_y,
                                         uint16_t flags = 0)
@@ -233,6 +272,78 @@ void TestSnapshotGenerationConsumption()
   Expect(VisionCaptureSampling::SnapshotPending(3U, consumed),
          "a request racing after an observed generation must remain for the "
          "next frame");
+}
+
+void TestControlInputLineFraming()
+{
+#if defined(_WIN32)
+  return;
+#else
+  int descriptors[2]{-1, -1};
+  Expect(::pipe(descriptors) == 0, "control input pipe must be created");
+
+  std::mutex lines_mutex;
+  std::vector<std::string> lines;
+  VisionCaptureDetail::StoppableLineInput input;
+  Expect(input.Start(descriptors[0],
+                     [&](std::string_view line)
+                     {
+                       std::lock_guard<std::mutex> lock(lines_mutex);
+                       lines.emplace_back(line);
+                     }),
+         "control input must start on a pipe");
+
+  Expect(WriteAll(descriptors[1], " sta") &&
+             WriteAll(descriptors[1], "rt \r\nsnapshot\nstatus"),
+         "fragmented control input must be writable");
+  Expect(::close(descriptors[1]) == 0, "control input write end must close");
+  descriptors[1] = -1;
+  Expect(WaitUntil(
+             [&]()
+             {
+               std::lock_guard<std::mutex> lock(lines_mutex);
+               return lines.size() == 3U;
+             },
+             std::chrono::seconds(2)),
+         "control input must deliver newline and EOF-terminated commands");
+  input.Stop();
+
+  {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    Expect(lines[0] == " start \r" && lines[1] == "snapshot" && lines[2] == "status",
+           "control input must preserve getline-compatible command text");
+  }
+  Expect(::close(descriptors[0]) == 0, "control input read end must close");
+#endif
+}
+
+void TestControlInputStopsWithoutEof()
+{
+#if defined(_WIN32)
+  return;
+#else
+  int descriptors[2]{-1, -1};
+  Expect(::pipe(descriptors) == 0, "stoppable control input pipe must be created");
+
+  std::atomic<uint32_t> lines{0};
+  VisionCaptureDetail::StoppableLineInput input;
+  Expect(input.Start(descriptors[0], [&](std::string_view) { lines.fetch_add(1U); }),
+         "stoppable control input must start");
+  Expect(WriteAll(descriptors[1], "pause\npartial"),
+         "control input with a partial line must be writable");
+  Expect(WaitUntil([&]() { return lines.load() == 1U; }, std::chrono::seconds(2)),
+         "complete control command must be delivered before stop");
+
+  const auto start = std::chrono::steady_clock::now();
+  input.Stop();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  Expect(elapsed < std::chrono::milliseconds(500),
+         "control input stop must not wait for newline or EOF");
+  Expect(lines.load() == 1U, "shutdown must not dispatch an incomplete command");
+
+  Expect(::close(descriptors[1]) == 0, "stoppable control write end must close");
+  Expect(::close(descriptors[0]) == 0, "stoppable control read end must close");
+#endif
 }
 
 void TestDropOldestWorkerLifecycle()
@@ -628,6 +739,8 @@ int main()
   TestDatasetModePolicy();
   TestIntrinsicVisualAdmission();
   TestSnapshotGenerationConsumption();
+  TestControlInputLineFraming();
+  TestControlInputStopsWithoutEof();
   TestDropOldestWorkerLifecycle();
   TestWorkerExceptionStopsQueue();
   TestImuContract();
