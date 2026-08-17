@@ -44,9 +44,10 @@
 
 同步 Topic 回调只 retain `SharedFrame` 并写入容量为 2 的 drop-oldest 队列，OpenCV、
 预览深拷贝和磁盘 I/O 全部在对象拥有的 worker 中执行，不反压 CameraFrameSync 发布
-线程。析构会停止并 join worker；由于 LibXR Topic 当前没有回调注销接口，调用方必须
-先停止上游发布再析构 `VisionCapture`。RGB8/RGBA8 输入会在 worker 内分别转换为
-OpenCV 的 BGR/BGRA 约定后再检测、预览和写图。worker 处理异常会关闭队列、释放
+线程。析构会先停止并 join 可取消的 stdin 控制读取器，再停止并 join 帧 worker；由于
+LibXR Topic 当前没有回调注销接口，调用方必须先停止上游发布再析构 `VisionCapture`。
+RGB8/RGBA8 输入会在 worker 内分别转换为 OpenCV 的 BGR/BGRA 约定后再检测、预览和
+写图。worker 处理异常会关闭队列、释放
 待处理帧并锁存会话失败，不会让异常越过线程入口终止进程。
 
 ## 相机内参标定
