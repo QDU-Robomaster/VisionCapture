@@ -3,72 +3,13 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: 同步图像/IMU 采集与标定数据记录模块
-constructor_args:
-  cfg:
-    mode: "record"
-    output_dir: "runs/vision_capture"
-    session_name: ""
-    record:
-      enabled: true
-      image_format: "bmp"
-      max_fps: 30.0
-      max_frames: 0
-      save_images: true
-      save_metadata: true
-      save_raw_imu: true
-      flush_every_n: 1
-    preview:
-      enabled: false
-      preview_window_name: "vision_capture"
-      preview_scale: 0.5
-      preview_wait_key_ms: 1
-      queue_capacity: 1
-      output_mode: "window"
-      web_bind_address: "0.0.0.0"
-      web_port: 8080
-      web_stream_name: "vision_capture"
-      max_fps: 30.0
-    board:
-      type: "aruco"
-      dictionary: "DICT_5X5_100"
-      marker_length_m: 0.04
-    camera_calibration:
-      enabled: false
-      marker_size_mm: 25.0
-      cols: 8
-      rows: 6
-      auto_save_views: 120
-    calibration_sampling:
-      enabled: true
-      auto_start: true
-      window_size: 8
-      min_accept_interval_us: 500000
-      max_pnp_reprojection_rms_px: 2.0
-      max_pnp_translation_jitter_m: 0.005
-      max_pnp_rotation_jitter_deg: 1.0
-      max_imu_rotation_jitter_deg: 0.8
-      max_gyro_norm_dps: 2.0
-      max_acc_norm_error_mps2: 1.5
-      max_acc_norm_jitter_mps2: 0.5
-      max_acc_direction_jitter_deg: 2.0
-      min_sample_translation_delta_m: 0.03
-      min_sample_rotation_delta_deg: 5.0
-    control:
-      stdin_enabled: false
-    filter:
-      require_synced_imu: true
-      max_image_imu_dt_us: 2000
-  sync: '@nullptr'
-template_args:
-  - Layout:
-      width: 720
-      height: 540
-      step: 2160
-      encoding: CameraTypes::Encoding::BGR8
-required_hardware: []
 depends:
-  - qdu-future/CameraFrameSync
-  - qdu-future/VisionPreview
+- id: QDU-Robomaster/CameraFrameSync
+  ref: same-or-dev
+- id: QDU-Robomaster/VisionPreview
+  ref: same-or-dev
+- id: QDU-Robomaster/CameraBase
+  ref: same-or-dev
 === END MANIFEST === */
 // clang-format on
 
@@ -107,8 +48,8 @@ depends:
 #include "VisionCaptureRecording.hpp"
 #include "VisionCaptureSampling.hpp"
 #include "VisionPreview.hpp"
-#include "app_framework.hpp"
 #include "libxr.hpp"
+#include "libxr_def.hpp"
 #include "logger.hpp"
 
 namespace VisionCaptureDetail
@@ -475,7 +416,7 @@ inline double RotationDistanceDeg(const cv::Mat& lhs_rvec, const cv::Mat& rhs_rv
  * LibXR Topic 不提供回调注销，因此调用方必须先停止上游发布，再析构本实例。
  */
 template <CameraTypes::FrameLayout FrameLayoutV>
-class VisionCapture : public LibXR::Application
+class VisionCapture
 {
  public:
   /// 对应的 CameraFrameSync 类型。
@@ -700,8 +641,7 @@ class VisionCapture : public LibXR::Application
   /**
    * @brief 构造同步采集模块并订阅同步帧 Topic。
    */
-  VisionCapture(LibXR::HardwareContainer&, LibXR::ApplicationManager& app, Config cfg,
-                Sync* sync)
+  VisionCapture(Config cfg, Sync* sync)
       : cfg_(cfg),
         calibration_(sync != nullptr ? sync->Calibration() : CameraCalibration{}),
         dictionary_(cv::aruco::getPredefinedDictionary(
@@ -726,7 +666,7 @@ class VisionCapture : public LibXR::Application
                        { HandleFrameProcessingFailure(error); });
     synced_frame_topic_.RegisterCallback(synced_frame_callback_);
     XR_LOG_INFO("VisionCapture subscribed: topic=%s", sync->SyncedFrameTopicName());
-    app.Register(*this);
+
     StartControlInputIfNeeded();
   }
 
@@ -742,16 +682,12 @@ class VisionCapture : public LibXR::Application
     preview_.Stop();
   }
 
-  VisionCapture(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app, Config cfg,
-                Sync& sync)
-      : VisionCapture(hw, app, std::move(cfg), &sync)
-  {
-  }
+  VisionCapture(Config cfg, Sync& sync) : VisionCapture(std::move(cfg), &sync) {}
 
   /**
    * @brief 周期输出采集、检测和采样计数。
    */
-  void OnMonitor() override
+  void OnMonitor()
   {
     const uint64_t frames = frames_seen_.exchange(0);
     const uint64_t saved = frames_saved_.exchange(0);
