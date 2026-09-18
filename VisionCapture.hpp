@@ -641,14 +641,17 @@ class VisionCapture
   /**
    * @brief 构造同步采集模块并订阅同步帧 Topic。
    */
-  VisionCapture(Config cfg, Sync* sync)
+  static Config DefaultConfig() { return {}; }
+
+  VisionCapture(
+      Sync& sync,
+      Config cfg = DefaultConfig())
       : cfg_(cfg),
-        calibration_(sync != nullptr ? sync->Calibration() : CameraCalibration{}),
+        calibration_(sync.Calibration()),
         dictionary_(cv::aruco::getPredefinedDictionary(
             VisionCaptureDetail::ArucoDictionaryId(cfg_.board.dictionary))),
         camera_calibration_(calibration_)
   {
-    ASSERT(sync != nullptr);
 
     NormalizeCalibrationConfig();
     detector_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
@@ -659,13 +662,13 @@ class VisionCapture
     StartCameraCalibrationIfNeeded();
     synced_frame_topic_ =
         LibXR::Topic(LibXR::Topic::FindOrCreate<SyncedFrameTopicPayload>(
-            sync->SyncedFrameTopicName()));
+            sync.SyncedFrameTopicName()));
     synced_frame_callback_ = LibXR::Topic::Callback::Create(OnSyncedFrameStatic, this);
     frame_queue_.Start([this](SyncedFrame frame) { ProcessFrame(frame); },
                        [this](std::exception_ptr error)
                        { HandleFrameProcessingFailure(error); });
     synced_frame_topic_.RegisterCallback(synced_frame_callback_);
-    XR_LOG_INFO("VisionCapture subscribed: topic=%s", sync->SyncedFrameTopicName());
+    XR_LOG_INFO("VisionCapture subscribed: topic=%s", sync.SyncedFrameTopicName());
 
     StartControlInputIfNeeded();
   }
@@ -682,7 +685,6 @@ class VisionCapture
     preview_.Stop();
   }
 
-  VisionCapture(Config cfg, Sync& sync) : VisionCapture(std::move(cfg), &sync) {}
 
   /**
    * @brief 周期输出采集、检测和采样计数。
