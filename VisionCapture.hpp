@@ -408,155 +408,204 @@ inline double RotationDistanceDeg(const cv::Mat& lhs_rvec, const cv::Mat& rhs_rv
 
 /**
  * @brief 同步图像和 IMU 采集模块。
+ *        Synchronized image and IMU capture Module.
  *
- * 模块从 CameraFrameSync 读取同步帧，可保存图像/IMU 元数据、显示预览、
- * 执行相机内参标定采样，并筛选后续手眼标定所需的稳定样本。
+ * @details 从 CameraFrameSync 读取同步帧，保存图像与 IMU 元数据、显示预览、
+ *          执行相机内参标定采样，并筛选手眼标定所需的稳定样本。Topic 回调只 retain
+ *          `SharedFrame` 并写入有界队列；析构时停止并 join worker，LibXR Topic
+ *          没有回调注销接口，因此上游停止发布之后才能析构本实例。
+ *          Reads the synchronized frames from CameraFrameSync, saves the images and the
+ *          IMU metadata, shows the preview, performs the camera intrinsic calibration
+ *          sampling and selects the stable samples needed for the hand-eye calibration.
+ *          The Topic callback only retains the `SharedFrame` and writes it into a bounded
+ *          queue; the destructor stops and joins the worker, and because LibXR Topic has
+ *          no callback deregistration the instance is destroyed after the upstream has
+ *          stopped publishing.
  *
- * Topic 回调只复制 SharedFrame 所有权并写入有界队列。析构会停止并 join worker；
- * LibXR Topic 不提供回调注销，因此调用方必须先停止上游发布，再析构本实例。
+ * @tparam FrameLayoutV 帧布局，与上游 CameraFrameSync 相同。
+ *                      Frame layout, equal to that of the upstream CameraFrameSync.
  */
 template <CameraTypes::FrameLayout FrameLayoutV>
 class VisionCapture
 {
  public:
-  /// 对应的 CameraFrameSync 类型。
-  using Sync = CameraFrameSync<FrameLayoutV>;
-  /// 同步后的图像帧类型。
-  using ImageFrame = typename Sync::ImageFrame;
-  /// 同步后的 IMU 数据类型。
-  using ImuStamped = typename Sync::ImuStamped;
-  /// 图像和 IMU 合包类型。
-  using SyncedFrame = typename Sync::SyncedFrame;
+  using Sync = CameraFrameSync<FrameLayoutV>;  ///< 对应的 CameraFrameSync 类型。
+  ///< CameraFrameSync type used by this Module.
+  using ImageFrame = typename Sync::ImageFrame;  ///< 同步后的图像帧类型。
+  ///< Synchronized image frame type.
+  using ImuStamped = typename Sync::ImuStamped;  ///< 同步后的 IMU 数据类型。
+  ///< Synchronized IMU data type.
+  using SyncedFrame = typename Sync::SyncedFrame;  ///< 图像和 IMU 合包类型。
+  ///< Combined image and IMU frame type.
   /// 同步帧普通 Topic 的借用 payload。
+  /// Borrowed payload of the synchronized frame Topic.
   using SyncedFrameTopicPayload = typename Sync::SyncedFrameTopicPayload;
   /// 原生传感器坐标系下的不可变相机标定。
+  /// Immutable camera calibration in the native sensor coordinate system.
   using CameraCalibration = typename Sync::CameraCalibration;
   /// 单帧到原生传感器坐标系的采样映射。
+  /// Sampling map from a single frame to the native sensor coordinate system.
   using FrameGeometry = CameraTypes::FrameGeometry;
 
   /// 编译期固定的帧存储布局。
+  /// Frame storage layout fixed at compile time.
   static inline constexpr auto frame_layout = Sync::frame_layout;
 
   /**
    * @brief 同步帧记录配置。
+   *        Synchronized frame record configuration.
    */
   struct RecordParams
   {
-    /// 是否保存同步帧。
-    bool enabled = true;
-    /// 图像文件扩展名，常用 `bmp` 或 `png`。
-    std::string_view image_format = "bmp";
-    /// 记录帧率上限，0 表示不限制。
-    double max_fps = 30.0;
-    /// 最多保存多少帧，0 表示不限制。
-    uint32_t max_frames = 0;
-    /// 是否保存图像文件。
-    bool save_images = true;
-    /// 是否保存 samples.csv。
-    bool save_metadata = true;
-    /// 是否在 samples.csv 中写入同步 IMU 数据。
-    bool save_raw_imu = true;
-    /// CSV 每写入多少行刷盘一次；0 表示仅在流关闭时刷盘。
-    uint32_t flush_every_n = 1;
+    bool enabled = true;  ///< 是否保存同步帧。
+    ///< Whether to save the synchronized frames.
+    std::string_view image_format = "bmp";  ///< 图像文件扩展名，常用 `bmp` 或 `png`。
+    ///< Image file extension, usually `bmp` or `png`.
+    double max_fps = 30.0;  ///< 记录帧率上限，0 表示不限制。
+    ///< Record rate limit in frames per second; 0 means unlimited.
+    uint32_t max_frames = 0;  ///< 最多保存多少帧，0 表示不限制。
+    ///< Maximum number of frames to save; 0 means unlimited.
+    bool save_images = true;  ///< 是否保存图像文件。
+    ///< Whether to save the image files.
+    bool save_metadata = true;  ///< 是否保存 samples.csv。
+    ///< Whether to save samples.csv.
+    bool save_raw_imu = true;  ///< 是否在 samples.csv 中写入同步 IMU 数据。
+    ///< Whether to write the synchronized IMU data to samples.csv.
+    uint32_t flush_every_n = 1;  ///< CSV 每写入多少行刷盘一次；0 表示仅在流关闭时刷盘。
+    ///< Number of rows between CSV flushes; 0 flushes only when the stream is closed.
   };
 
   /**
    * @brief 标定板检测配置。
+   *        Board detection configuration.
    */
   struct BoardParams
   {
-    /// 当前支持 `aruco`。
-    std::string_view type = "aruco";
-    /// OpenCV ArUco 字典名称。
-    std::string_view dictionary = "DICT_5X5_100";
-    /// 单个 marker 边长，单位 m。
-    double marker_length_m = 0.04;
+    std::string_view type = "aruco";  ///< 当前支持 `aruco`。
+    ///< Board type; `aruco` is supported.
+    std::string_view dictionary = "DICT_5X5_100";  ///< OpenCV ArUco 字典名称。
+    ///< OpenCV ArUco dictionary name.
+    double marker_length_m = 0.04;  ///< 单个 marker 边长，单位 m。
+    ///< Side length of one marker in m.
   };
 
   /**
    * @brief 同步帧过滤配置。
+   *        Synchronized frame filter configuration.
    */
   struct FilterParams
   {
     /// 保留的配置字段，输入已由 CameraFrameSync 配对，当前不读取。
+    /// Reserved configuration field, currently not read; the input is already paired by
+    /// CameraFrameSync.
     bool require_synced_imu = true;
-    /// 保留的配置字段，当前不读取。
-    uint32_t max_image_imu_dt_us = 2000;
+    uint32_t max_image_imu_dt_us = 2000;  ///< 保留的配置字段，当前不读取。
+    ///< Reserved configuration field, currently not read.
   };
 
   /**
    * @brief 相机内参标定配置。
+   *        Camera intrinsic calibration configuration.
    */
   struct CameraCalibrationParams
   {
-    /// 是否启用相机内参标定。
-    bool enabled = false;
-    /// marker 黑码区域边长，单位 mm。
-    double marker_size_mm = 25.0;
-    /// GShang 标定板棋盘列数。
-    int cols = 8;
-    /// GShang 标定板棋盘行数。
-    int rows = 6;
-    /// 自动求解前需要接受的视角数量。
-    uint32_t auto_save_views = 120;
+    bool enabled = false;  ///< 是否启用相机内参标定。
+    ///< Whether the camera intrinsic calibration is enabled.
+    double marker_size_mm = 25.0;  ///< marker 黑码区域边长，单位 mm。
+    ///< Side length of the marker black area in mm.
+    int cols = 8;  ///< GShang 标定板棋盘列数。
+    ///< Number of columns of the GShang board.
+    int rows = 6;  ///< GShang 标定板棋盘行数。
+    ///< Number of rows of the GShang board.
+    uint32_t auto_save_views = 120;  ///< 自动求解前需要接受的视角数量。
+    ///< Number of views to accept before solving automatically.
   };
 
   /**
    * @brief 标定采样判稳配置。
+   *        Calibration sampling stability configuration.
    */
   struct CalibrationSamplingParams
   {
-    /// 是否启用判稳采样。
-    bool enabled = true;
-    /// true 表示启动后立即开始采样。
-    bool auto_start = true;
-    /// 计算稳定性时保留的最近样本数。
-    uint32_t window_size = 8;
+    bool enabled = true;  ///< 是否启用判稳采样。
+    ///< Whether the stability sampling is enabled.
+    bool auto_start = true;  ///< true 表示启动后立即开始采样。
+    ///< True starts sampling immediately after launch.
+    uint32_t window_size = 8;  ///< 计算稳定性时保留的最近样本数。
+    ///< Number of recent samples kept for the stability computation.
     /// 两个接受样本之间的最小时间间隔，单位 us。
+    /// Minimum interval between two accepted samples in us.
     uint64_t min_accept_interval_us = 500000;
-    /// PnP 重投影 RMS 上限，单位像素。
-    double max_pnp_reprojection_rms_px = 2.0;
-    /// PnP 平移抖动上限，单位 m。
-    double max_pnp_translation_jitter_m = 0.005;
-    /// PnP 旋转抖动上限，单位 deg。
-    double max_pnp_rotation_jitter_deg = 1.0;
-    /// IMU 四元数抖动上限，单位 deg。
-    double max_imu_rotation_jitter_deg = 0.8;
-    /// 陀螺仪模长上限，单位 deg/s。
-    double max_gyro_norm_dps = 2.0;
+    double max_pnp_reprojection_rms_px = 2.0;  ///< PnP 重投影 RMS 上限，单位像素。
+    ///< Upper limit of the PnP reprojection RMS in pixels.
+    double max_pnp_translation_jitter_m = 0.005;  ///< PnP 平移抖动上限，单位 m。
+    ///< Upper limit of the PnP translation jitter in m.
+    double max_pnp_rotation_jitter_deg = 1.0;  ///< PnP 旋转抖动上限，单位 deg。
+    ///< Upper limit of the PnP rotation jitter in deg.
+    double max_imu_rotation_jitter_deg = 0.8;  ///< IMU 四元数抖动上限，单位 deg。
+    ///< Upper limit of the IMU quaternion jitter in deg.
+    double max_gyro_norm_dps = 2.0;  ///< 陀螺仪模长上限，单位 deg/s。
+    ///< Upper limit of the gyroscope norm in deg/s.
     /// 加速度模长与重力加速度差值上限，单位 m/s^2。
+    /// Upper limit of the difference between the acceleration norm and gravity in m/s^2.
     double max_acc_norm_error_mps2 = 1.5;
-    /// 加速度模长抖动上限，单位 m/s^2。
-    double max_acc_norm_jitter_mps2 = 0.5;
-    /// 加速度方向抖动上限，单位 deg。
-    double max_acc_direction_jitter_deg = 2.0;
+    double max_acc_norm_jitter_mps2 = 0.5;  ///< 加速度模长抖动上限，单位 m/s^2。
+    ///< Upper limit of the acceleration norm jitter in m/s^2.
+    double max_acc_direction_jitter_deg = 2.0;  ///< 加速度方向抖动上限，单位 deg。
+    ///< Upper limit of the acceleration direction jitter in deg.
     /// 与已接受样本相比需要达到的最小平移变化，单位 m。
+    /// Minimum translation change relative to the accepted samples in m.
     double min_sample_translation_delta_m = 0.03;
     /// 与已接受样本相比需要达到的最小姿态变化，单位 deg。
+    /// Minimum attitude change relative to the accepted samples in deg.
     double min_sample_rotation_delta_deg = 5.0;
   };
 
   /**
    * @brief 本地命令配置。
+   *        Local command configuration.
    */
   struct ControlParams
   {
     /// true 时从标准输入读取 start/pause/reset/status 等命令。
+    /// When true, commands such as start, pause, reset and status are read from the
+    /// standard input.
     bool stdin_enabled = false;
   };
 
   /**
    * @brief VisionCapture 总配置。
+   *        Overall VisionCapture configuration.
    */
   struct Config
   {
     /**
-     * @brief 默认配置。
+     * @brief 默认配置，各项取成员默认值。
+     *        Default configuration with the member defaults.
      */
     Config() = default;
 
     /**
-     * @brief 供只填写基础配置项的生成代码使用。
+     * @brief 基础配置构造，`calibration_sampling`、`control` 取默认值。
+     *        Construct from the basic configuration; `calibration_sampling` and `control`
+     *        take their defaults.
+     *
+     * @param mode_in 运行模式。
+     *                Run mode.
+     * @param output_dir_in 输出根目录。
+     *                      Output root directory.
+     * @param session_name_in 会话名称。
+     *                        Session name.
+     * @param record_in 同步帧记录配置。
+     *                  Synchronized frame record configuration.
+     * @param preview_in 预览配置。
+     *                   Preview configuration.
+     * @param board_in 标定板检测配置。
+     *                 Board detection configuration.
+     * @param camera_calibration_in 相机内参标定配置。
+     *                              Camera intrinsic calibration configuration.
+     * @param filter_in 同步帧过滤配置。
+     *                  Synchronized frame filter configuration.
      */
     Config(std::string_view mode_in, std::string_view output_dir_in,
            std::string_view session_name_in, RecordParams record_in,
@@ -574,7 +623,27 @@ class VisionCapture
     }
 
     /**
-     * @brief 供填写 calibration_sampling 的生成代码使用。
+     * @brief 含 `calibration_sampling` 的构造，`control` 取默认值。
+     *        Construct including `calibration_sampling`; `control` takes its default.
+     *
+     * @param mode_in 运行模式。
+     *                Run mode.
+     * @param output_dir_in 输出根目录。
+     *                      Output root directory.
+     * @param session_name_in 会话名称。
+     *                        Session name.
+     * @param record_in 同步帧记录配置。
+     *                  Synchronized frame record configuration.
+     * @param preview_in 预览配置。
+     *                   Preview configuration.
+     * @param board_in 标定板检测配置。
+     *                 Board detection configuration.
+     * @param camera_calibration_in 相机内参标定配置。
+     *                              Camera intrinsic calibration configuration.
+     * @param calibration_sampling_in 标定采样判稳配置。
+     *                                Calibration sampling stability configuration.
+     * @param filter_in 同步帧过滤配置。
+     *                  Synchronized frame filter configuration.
      */
     Config(std::string_view mode_in, std::string_view output_dir_in,
            std::string_view session_name_in, RecordParams record_in,
@@ -594,7 +663,29 @@ class VisionCapture
     }
 
     /**
-     * @brief 完整配置。
+     * @brief 完整配置构造。
+     *        Construct from the complete configuration.
+     *
+     * @param mode_in 运行模式。
+     *                Run mode.
+     * @param output_dir_in 输出根目录。
+     *                      Output root directory.
+     * @param session_name_in 会话名称。
+     *                        Session name.
+     * @param record_in 同步帧记录配置。
+     *                  Synchronized frame record configuration.
+     * @param preview_in 预览配置。
+     *                   Preview configuration.
+     * @param board_in 标定板检测配置。
+     *                 Board detection configuration.
+     * @param camera_calibration_in 相机内参标定配置。
+     *                              Camera intrinsic calibration configuration.
+     * @param calibration_sampling_in 标定采样判稳配置。
+     *                                Calibration sampling stability configuration.
+     * @param control_in 本地命令配置。
+     *                   Local command configuration.
+     * @param filter_in 同步帧过滤配置。
+     *                  Synchronized frame filter configuration.
      */
     Config(std::string_view mode_in, std::string_view output_dir_in,
            std::string_view session_name_in, RecordParams record_in,
@@ -615,34 +706,50 @@ class VisionCapture
     {
     }
 
-    /// 运行模式：`record`、`calibrate_camera`、`calibrate_handeye` 或
-    /// `calibrate`。
+    /// 运行模式：`record`、`calibrate_camera`、`calibrate_handeye` 或 `calibrate`。
+    /// Run mode: `record`, `calibrate_camera`, `calibrate_handeye` or `calibrate`.
     std::string_view mode = "record";
-    /// 输出根目录。
-    std::string_view output_dir = "runs/vision_capture";
-    /// 会话名称；为空时自动使用时间戳。
-    std::string_view session_name = "";
-    /// 同步帧记录配置。
-    RecordParams record{};
-    /// 预览配置。
-    VisionPreview::RuntimeParam preview{};
-    /// 标定板检测配置。
-    BoardParams board{};
-    /// 相机内参标定配置。
-    CameraCalibrationParams camera_calibration{};
-    /// 标定采样判稳配置。
-    CalibrationSamplingParams calibration_sampling{};
-    /// 本地命令配置。
-    ControlParams control{};
-    /// 同步帧过滤配置。
-    FilterParams filter{};
+    std::string_view output_dir = "runs/vision_capture";  ///< 输出根目录。
+    ///< Output root directory.
+    std::string_view session_name = "";  ///< 会话名称；为空时自动使用时间戳。
+    ///< Session name; the timestamp is used when empty.
+    RecordParams record{};  ///< 同步帧记录配置。
+    ///< Synchronized frame record configuration.
+    VisionPreview::RuntimeParam preview{};  ///< 预览配置。
+    ///< Preview configuration.
+    BoardParams board{};  ///< 标定板检测配置。
+    ///< Board detection configuration.
+    CameraCalibrationParams camera_calibration{};  ///< 相机内参标定配置。
+    ///< Camera intrinsic calibration configuration.
+    CalibrationSamplingParams calibration_sampling{};  ///< 标定采样判稳配置。
+    ///< Calibration sampling stability configuration.
+    ControlParams control{};  ///< 本地命令配置。
+    ///< Local command configuration.
+    FilterParams filter{};  ///< 同步帧过滤配置。
+    ///< Synchronized frame filter configuration.
   };
 
   /**
-   * @brief 构造同步采集模块并订阅同步帧 Topic。
+   * @brief 获取默认配置。
+   *        Get the default configuration.
+   *
+   * @return 各项取默认值的配置。
+   *         A configuration with all defaults.
    */
   static Config DefaultConfig() { return {}; }
 
+  /**
+   * @brief 构造 VisionCapture：复制 `sync` 的原生标定，准备输出目录，订阅同步帧 Topic，
+   *        并启动帧 worker 与可选的 stdin 控制。
+   *        Construct VisionCapture: copy the native calibration of `sync`, prepare the
+   *        output directory, subscribe to the synchronized frame Topic and start the
+   *        frame worker and the optional stdin control.
+   *
+   * @param sync 上游 CameraFrameSync 实例。
+   *             Upstream CameraFrameSync instance.
+   * @param cfg 模块配置。
+   *            Module configuration.
+   */
   VisionCapture(
       Sync& sync,
       Config cfg = DefaultConfig())
@@ -675,8 +782,12 @@ class VisionCapture
 
   /**
    * @brief 停止控制输入和帧处理 worker，并释放队列中 retain 的 SharedFrame。
+   *        Stop the control input and the frame worker and release the SharedFrames
+   *        retained in the queue.
    *
-   * 上游必须已经停止发布；LibXR Topic 当前没有回调注销接口。
+   * @note 需在上游停止发布之后调用；LibXR Topic 当前没有回调注销接口。
+   *       To be called after the upstream has stopped publishing; LibXR Topic currently
+   *       has no callback deregistration.
    */
   ~VisionCapture()
   {
@@ -687,7 +798,9 @@ class VisionCapture
 
 
   /**
-   * @brief 周期输出采集、检测和采样计数。
+   * @brief 周期输出采集、检测和采样计数，并清零计数。
+   *        Periodically print the capture, detection and sampling counters and reset
+   *        them.
    */
   void OnMonitor()
   {
