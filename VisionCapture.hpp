@@ -750,9 +750,7 @@ class VisionCapture
    * @param cfg 模块配置。
    *            Module configuration.
    */
-  VisionCapture(
-      Sync& sync,
-      Config cfg = DefaultConfig())
+  VisionCapture(Sync& sync, Config cfg = DefaultConfig())
       : cfg_(cfg),
         calibration_(sync.Calibration()),
         dictionary_(cv::aruco::getPredefinedDictionary(
