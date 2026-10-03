@@ -245,9 +245,9 @@ Configuration parameters `cfg` (`Config`, `DefaultConfig()` holds all defaults):
 
 ## 8. 配置示例 / Configuration Example
 
-`xrobot instance add QDU-Robomaster/VisionCapture` 写入含空 `template_args` 的实例；`template_args` 填写为 `constexprs` 中定义的帧布局，`sync` 填写为 CameraFrameSync 实例的 id。`Config` 带有多个构造函数，`cfg` 写成 YAML map 时，键为其中一个构造函数的参数名（`mode_in`、`output_dir_in`、`session_name_in`、`record_in`、`preview_in`、`board_in`、`camera_calibration_in`、`calibration_sampling_in`、`control_in`、`filter_in`，其中 `calibration_sampling_in` 与 `control_in` 可成组省略），子结构按字段名写 map：
+`xrobot instance add QDU-Robomaster/VisionCapture --template-arg <FrameLayout>` 写入的实例：`template_args` 引用 `constexprs` 中定义的帧布局，`sync` 填写为 CameraFrameSync 实例的 id，`cfg` 为工具写入的 C++ 表达式 `DefaultConfig()`，各字段取第 6 节列出的默认值。
 
-`xrobot instance add QDU-Robomaster/VisionCapture` writes an instance with an empty `template_args`. `template_args` is set to a frame layout defined in `constexprs`, and `sync` to the id of a CameraFrameSync instance. `Config` has several constructors; when `cfg` is written as a YAML map, the keys are the parameter names of one of them (`mode_in`, `output_dir_in`, `session_name_in`, `record_in`, `preview_in`, `board_in`, `camera_calibration_in`, `calibration_sampling_in`, `control_in`, `filter_in`, where `calibration_sampling_in` and `control_in` can be omitted as a group), and sub-structures are written as maps by field name:
+The instance written by `xrobot instance add QDU-Robomaster/VisionCapture --template-arg <FrameLayout>`: `template_args` refers to a frame layout defined in `constexprs`, `sync` is set to the id of a CameraFrameSync instance, and `cfg` is the C++ expression `DefaultConfig()` written by the tool, whose fields take the defaults listed in section 6.
 
 ```yaml
 constexpr_namespace: AutoAimRunConfig
@@ -264,48 +264,12 @@ modules:
       - AutoAimRunConfig::HikFrameLayout
     args:
       - sync: camera_frame_sync
-      - cfg:
-          mode_in: "record"
-          output_dir_in: "runs/vision_capture"
-          session_name_in: "hik_capture"
-          record_in:
-            enabled: true
-            image_format: "bmp"
-            max_fps: 30.0
-            max_frames: 0
-            save_images: true
-            save_metadata: true
-            save_raw_imu: true
-            flush_every_n: 1
-          preview_in:
-            enabled: true
-            preview_window_name: "vision_capture"
-            preview_scale: 0.5
-            preview_wait_key_ms: 1
-            queue_capacity: 1
-            output_mode: "web"
-            web_bind_address: "0.0.0.0"
-            web_port: 8080
-            web_stream_name: "vision_capture"
-            max_fps: 30.0
-          board_in:
-            type: "aruco"
-            dictionary: "DICT_5X5_100"
-            marker_length_m: 0.04
-          camera_calibration_in:
-            enabled: true
-            marker_size_mm: 25.0
-            cols: 8
-            rows: 6
-            auto_save_views: 120
-          filter_in:
-            require_synced_imu: true
-            max_image_imu_dt_us: 2000
+      - cfg: VisionCapture<AutoAimRunConfig::HikFrameLayout>::DefaultConfig()
 ```
 
-被引用的 CameraFrameSync 实例列在本实例之前，并使用相同的 `template_args`。
+`Config` 带有多个构造函数，`cfg` 写成 YAML map 时，键为其中一个构造函数的参数名（`mode_in`、`output_dir_in`、`session_name_in`、`record_in`、`preview_in`、`board_in`、`camera_calibration_in`、`calibration_sampling_in`、`control_in`、`filter_in`，其中 `calibration_sampling_in` 与 `control_in` 可成组省略），子结构按字段名写 map，字段名见第 6 节。被引用的 CameraFrameSync 实例列在本实例之前，并使用相同的 `template_args`。
 
-The referenced CameraFrameSync instance is listed before this instance and uses the same `template_args`.
+`Config` has several constructors; when `cfg` is written as a YAML map, the keys are the parameter names of one of them (`mode_in`, `output_dir_in`, `session_name_in`, `record_in`, `preview_in`, `board_in`, `camera_calibration_in`, `calibration_sampling_in`, `control_in`, `filter_in`, where `calibration_sampling_in` and `control_in` can be omitted as a group), and sub-structures are written as maps by field name, with the field names in section 6. The referenced CameraFrameSync instance is listed before this instance and uses the same `template_args`.
 
 ## 9. 依赖与硬件 / Dependencies and Hardware
 
