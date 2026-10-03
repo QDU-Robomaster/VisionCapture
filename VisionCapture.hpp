@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: 同步图像/IMU 采集与标定数据记录模块
+module_description: 同步图像与 IMU 采集模块：记录 CameraFrameSync 输出，并完成相机内参标定与手眼标定数据采样 / Synchronized image and IMU capture Module that records the CameraFrameSync output and performs camera intrinsic calibration and hand-eye calibration sampling
 depends:
 - id: QDU-Robomaster/CameraFrameSync
   ref: same-or-dev
@@ -478,9 +478,9 @@ class VisionCapture
    */
   struct FilterParams
   {
-    /// 旧 YAML 兼容字段；输入已由 CameraFrameSync 配对，标定模式不读取本字段。
+    /// 保留的配置字段，输入已由 CameraFrameSync 配对，当前不读取。
     bool require_synced_imu = true;
-    /// 旧 YAML 兼容字段；相机和 MCU 时间域不可直接相减，当前实现不使用本字段。
+    /// 保留的配置字段，当前不读取。
     uint32_t max_image_imu_dt_us = 2000;
   };
 
@@ -1061,7 +1061,7 @@ class VisionCapture
   }
 
   /**
-   * @brief 从原生 K 和当前采样几何派生兼容旧记录工具的帧坐标 K。
+   * @brief 从原生 K 和当前采样几何派生帧坐标 K。
    */
   std::array<double, 9> FrameCameraMatrix(const FrameGeometry& geometry) const
   {
@@ -1104,7 +1104,7 @@ class VisionCapture
   }
 
   /**
-   * @brief 首帧到达时保存 geometry，并保留旧 camera_info.txt 派生快照。
+   * @brief 首帧到达时保存 geometry 并写出 camera_info.txt 派生快照。
    */
   bool WriteFrameGeometrySnapshot(const FrameGeometry& geometry)
   {
@@ -2251,7 +2251,7 @@ class VisionCapture
       XR_LOG_ERROR("VisionCapture samples.csv is not open");
       return false;
     }
-    // 相机和 MCU 时间戳属于不同时间域；保留兼容 dt_us 列但永远不相减。
+    // 相机和 MCU 时间戳属于不同时间域，dt_us 列留空。
     metadata_csv_ << frame_id << "," << image_ts << "," << imu_ts << ",";
     VisionCaptureRecording::WriteRawImuCells(metadata_csv_, cfg_.record.save_raw_imu,
                                              imu.rotation_wxyz, imu.angular_velocity_xyz,
@@ -2389,7 +2389,7 @@ class VisionCapture
   bool unsupported_encoding_logged_{false};
   /// 是否已经打印过非法 geometry 错误。
   bool invalid_geometry_logged_{false};
-  /// 首帧 geometry 和兼容 camera_info 快照是否已经写出。
+  /// 首帧 geometry 和 camera_info 快照是否已经写出。
   bool frame_geometry_snapshot_written_{false};
 
   /// monitor 周期内看到的同步帧数。
