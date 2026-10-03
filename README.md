@@ -118,11 +118,7 @@ Configuration:
 - `camera_calibration.marker_size_mm`, `cols` and `rows`: the calibration modes normalize them to `25.0` / `8` / `6` and print a warning when the values differ.
 - `camera_calibration.auto_save_views`: once the number of accepted views reaches this value, the result is solved and saved automatically; `0` means the `solve` command triggers it.
 
-Output directory (relative to the process working directory):
-
-```text
-runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
-```
+Output directory (relative to the process working directory) as in the code block above.
 
 Outputs:
 
