@@ -210,7 +210,7 @@ VisionCapture(Sync& sync, Config cfg = DefaultConfig());
 - `camera_calibration`（`CameraCalibrationParams`）：`enabled = false`、`marker_size_mm = 25.0`、`cols = 8`、`rows = 6`、`auto_save_views = 120`。
 - `calibration_sampling`（`CalibrationSamplingParams`）：`enabled = true`、`auto_start = true`、`window_size = 8`、`min_accept_interval_us = 500000`，以及手眼门限 `max_pnp_reprojection_rms_px = 2.0`、`max_pnp_translation_jitter_m = 0.005`、`max_pnp_rotation_jitter_deg = 1.0`、`max_imu_rotation_jitter_deg = 0.8`、`max_gyro_norm_dps = 2.0`、`max_acc_norm_error_mps2 = 1.5`、`max_acc_norm_jitter_mps2 = 0.5`、`max_acc_direction_jitter_deg = 2.0`、`min_sample_translation_delta_m = 0.03`、`min_sample_rotation_delta_deg = 5.0`。
 - `control`（`ControlParams`）：`stdin_enabled = false`。
-- `filter`（`FilterParams`）：`require_synced_imu = true`、`max_image_imu_dt_us = 2000`。
+- `filter`（`FilterParams`）：图像与 IMU 的配对条件，`require_synced_imu = true`（是否要求图像带有同步 IMU）、`max_image_imu_dt_us = 2000`（图像与 IMU 时间戳之差的上限，单位 us）。
 
 Template parameter:
 
@@ -231,7 +231,7 @@ Configuration parameters `cfg` (`Config`, `DefaultConfig()` holds all defaults):
 - `camera_calibration` (`CameraCalibrationParams`): `enabled = false`, `marker_size_mm = 25.0`, `cols = 8`, `rows = 6`, `auto_save_views = 120`.
 - `calibration_sampling` (`CalibrationSamplingParams`): `enabled = true`, `auto_start = true`, `window_size = 8`, `min_accept_interval_us = 500000`, and the hand-eye gates `max_pnp_reprojection_rms_px = 2.0`, `max_pnp_translation_jitter_m = 0.005`, `max_pnp_rotation_jitter_deg = 1.0`, `max_imu_rotation_jitter_deg = 0.8`, `max_gyro_norm_dps = 2.0`, `max_acc_norm_error_mps2 = 1.5`, `max_acc_norm_jitter_mps2 = 0.5`, `max_acc_direction_jitter_deg = 2.0`, `min_sample_translation_delta_m = 0.03`, `min_sample_rotation_delta_deg = 5.0`.
 - `control` (`ControlParams`): `stdin_enabled = false`.
-- `filter` (`FilterParams`): `require_synced_imu = true`, `max_image_imu_dt_us = 2000`.
+- `filter` (`FilterParams`): the pairing conditions of image and IMU, `require_synced_imu = true` (whether an image requires a synchronized IMU sample) and `max_image_imu_dt_us = 2000` (upper bound of the difference between the image and IMU timestamps, in us).
 
 ## 7. Topic
 
