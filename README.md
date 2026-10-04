@@ -15,7 +15,7 @@ VisionCapture 订阅 CameraFrameSync 发布的同步图像与 IMU 数据，按�
 
 `record` 配合 `camera_calibration.enabled: true` 也进入内参标定。`calibrate_handeye` 的优先级高于该开关，只运行手眼数据采集。
 
-同步 Topic 回调只复制 `SharedFrame` 句柄，并写入容量为 2、满时丢弃最旧一帧的队列；OpenCV、预览深拷贝和磁盘 I/O 都在模块拥有的工作线程中执行，CameraFrameSync 的发布线程不受影响。析构时先停止可取消的 stdin 控制读取器并等待其退出，再停止帧工作线程并等待其退出；`VisionCapture` 在上游停止发布之后析构。输入图像支持 BGR8、RGB8、BGRA8、RGBA8 和 MONO8，RGB8 / RGBA8 在工作线程内转换为 OpenCV 的 BGR / BGRA 约定后再检测、预览和写图。工作线程处理异常时关闭队列、释放待处理帧并锁存会话失败。
+图像检测、预览和写盘在模块自己的工作线程中执行，CameraFrameSync 的发布线程不受影响。`VisionCapture` 在上游停止发布之后析构。输入图像支持 BGR8、RGB8、BGRA8、RGBA8 和 MONO8。工作线程、帧队列、析构顺序和求解写盘的实现细节见 [docs/internals.md](docs/internals.md)。
 
 `OnMonitor()` 打印自上次调用以来的帧数、保存数、检测到标定板的帧数、PnP 成功数、接受与拒绝的样本数、队列丢弃数，以及当前模式和采样状态。
 
@@ -30,7 +30,7 @@ Run modes:
 
 `record` together with `camera_calibration.enabled: true` also enters the intrinsic calibration. `calibrate_handeye` takes priority over that switch and runs the hand-eye data collection only.
 
-The synchronized Topic callback only retains the `SharedFrame` and writes it into a drop-oldest queue of capacity 2. OpenCV, the preview deep copy and the disk I/O all run in a worker owned by the Module, so the publishing thread of CameraFrameSync is unaffected. The destructor first stops and joins the cancellable stdin control reader and then stops and joins the frame worker; `VisionCapture` is destroyed after the upstream publishing has stopped. The input images support BGR8, RGB8, BGRA8, RGBA8 and MONO8; RGB8 / RGBA8 are converted in the worker to the OpenCV BGR / BGRA convention before detection, preview and image writing. When the worker raises an exception, the queue is closed, the pending frames are released and the session failure is latched.
+Image detection, preview and disk writing run on a worker thread owned by the Module, so the publishing thread of CameraFrameSync is unaffected. `VisionCapture` is destroyed after the upstream publishing has stopped. The input images support BGR8, RGB8, BGRA8, RGBA8 and MONO8. The implementation details of the worker thread, the frame queue, the destruction order and the solve-and-write run are in [docs/internals.md](docs/internals.md).
 
 `OnMonitor()` prints the frame count, the saved count, the number of frames with a detected board, the PnP success count, the accepted and rejected sample counts and the queue drop count since the previous call, together with the current mode and sampling status.
 
@@ -58,7 +58,7 @@ The synchronized Topic callback only retains the `SharedFrame` and writes it int
 - `save_raw_imu: false` 时 `samples.csv` 保持固定列结构，十个原始 IMU 数值单元格留空。
 - `flush_every_n: 0` 表示只在文件流关闭时刷盘，否则每成功记录指定行数后同时刷新两个 CSV。
 - 相机和 MCU 时间戳属于不同时间域，`samples.csv` 分别保存两者，`dt_us` 列为空；原始加速度遵循 `CameraBase::ImuStamped` 的 `m/s^2` 约定，单位记录在末列。
-- 任一必需记录或 CSV 刷盘失败时，会话失败被锁存，内参求解视角被清空，`solve` 不再返回 PASS；图像和元数据完整持久化后，该帧才提交给内参求解器。
+- 任一必需记录或 CSV 刷盘失败时，本次会话记为失败，`solve` 不再返回 PASS。
 
 The record directory is `<output_dir>/<session_name>`. When `session_name` is empty the Module generates `vision_capture_<YYYYmmdd_HHMMSS>` as the directory name.
 
@@ -82,7 +82,7 @@ Record details:
 - With `save_raw_imu: false`, `samples.csv` keeps its fixed column layout and the ten raw IMU value cells are left empty.
 - `flush_every_n: 0` flushes only when the file stream is closed; otherwise both CSV files are flushed after every given number of successfully recorded rows.
 - Camera and MCU timestamps belong to different time domains; `samples.csv` stores both and the `dt_us` column is empty. The raw acceleration follows the `m/s^2` convention of `CameraBase::ImuStamped`, and the unit is recorded in the last column.
-- When any required record or CSV flush fails, the session failure is latched, the intrinsic solver views are cleared and `solve` no longer returns PASS; a frame is submitted to the intrinsic solver after its image and metadata are completely persisted.
+- When any required record or CSV flush fails, the session is marked as failed and `solve` no longer returns PASS.
 
 ## 3. 相机内参标定 / Camera Intrinsic Calibration
 
@@ -109,7 +109,7 @@ runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
 
 `camera_info_snippet.txt` 是可粘贴到 BSP `User/xrobot.yaml` 的 `constexprs` 片段，包含 `MainFrameLayout`（`CameraTypes::FrameLayout`）与原生 `MainCameraCalibration`（`CameraTypes::CameraCalibration`），值以 YAML map 写出。原生尺寸、焦距、主点、畸变系数与 `quality_report.txt` 中的重投影 RMS 用于判断结果是否可用。离群阈值、`rms`、`views.csv` 和质量报告中的重投影误差使用当前帧像素，`calibration.yml` 另存 `native_rms` 供原生坐标诊断。
 
-`quality_ok` 要求视角数、中心与尺度覆盖、最终外参恢复出的双轴标定板倾斜跨度、内参合理性以及全局与逐视角重投影误差全部通过；在此基础上所有输出逐字节写后读回成功，求解才返回成功并生成 `calibration.yml` 与 `camera_info_snippet.txt`。质量未通过时只保留 `views.csv` 和 `quality_report.txt`。自动保存与 stdin `solve` 共用同一次求解与写盘，并发的重复请求等待并复用同一结果。
+`quality_ok` 要求视角数、中心与尺度覆盖、最终外参恢复出的双轴标定板倾斜跨度、内参合理性以及全局与逐视角重投影误差全部通过，且所有输出写入成功，求解才返回成功并生成 `calibration.yml` 与 `camera_info_snippet.txt`。质量未通过时只保留 `views.csv` 和 `quality_report.txt`。
 
 Both calibration modes use the GShang 25 mm, 8x6 board and the ArUco original dictionary; `board.*` is used for the detection in the `record` mode. The intrinsic calibrator receives the images that pass the pure vision gates and uses only the visual observations in the images.
 
@@ -130,7 +130,7 @@ Outputs:
 
 `camera_info_snippet.txt` is a `constexprs` snippet that can be pasted into the BSP `User/xrobot.yaml`. It contains `MainFrameLayout` (`CameraTypes::FrameLayout`) and the native `MainCameraCalibration` (`CameraTypes::CameraCalibration`), with the values written as YAML maps. The native size, focal lengths, principal point, distortion coefficients and the reprojection RMS in `quality_report.txt` serve to judge whether the result is usable. The outlier thresholds, `rms`, `views.csv` and the reprojection errors in the quality report use current-frame pixels, and `calibration.yml` additionally stores `native_rms` for diagnostics in native coordinates.
 
-`quality_ok` requires the view count, the center and scale coverage, the dual-axis board tilt span recovered from the final extrinsics, the intrinsic plausibility and the global and per-view reprojection errors all to pass; in addition every output has to be written and read back byte for byte, and only then does the solve return success and generate `calibration.yml` and `camera_info_snippet.txt`. When the quality check fails, only `views.csv` and `quality_report.txt` are kept. The automatic save and the stdin `solve` share one solve-and-write run, and concurrent duplicate requests wait for and reuse the same result.
+`quality_ok` requires the view count, the center and scale coverage, the dual-axis board tilt span recovered from the final extrinsics, the intrinsic plausibility and the global and per-view reprojection errors all to pass, and every output has to be written successfully; only then does the solve return success and generate `calibration.yml` and `camera_info_snippet.txt`. When the quality check fails, only `views.csv` and `quality_report.txt` are kept.
 
 ## 4. 采样判稳 / Sampling Stability
 
@@ -210,7 +210,7 @@ VisionCapture(Sync& sync, Config cfg = DefaultConfig());
 - `camera_calibration`（`CameraCalibrationParams`）：`enabled = false`、`marker_size_mm = 25.0`、`cols = 8`、`rows = 6`、`auto_save_views = 120`。
 - `calibration_sampling`（`CalibrationSamplingParams`）：`enabled = true`、`auto_start = true`、`window_size = 8`、`min_accept_interval_us = 500000`，以及手眼门限 `max_pnp_reprojection_rms_px = 2.0`、`max_pnp_translation_jitter_m = 0.005`、`max_pnp_rotation_jitter_deg = 1.0`、`max_imu_rotation_jitter_deg = 0.8`、`max_gyro_norm_dps = 2.0`、`max_acc_norm_error_mps2 = 1.5`、`max_acc_norm_jitter_mps2 = 0.5`、`max_acc_direction_jitter_deg = 2.0`、`min_sample_translation_delta_m = 0.03`、`min_sample_rotation_delta_deg = 5.0`。
 - `control`（`ControlParams`）：`stdin_enabled = false`。
-- `filter`（`FilterParams`）：`require_synced_imu = true`、`max_image_imu_dt_us = 2000`。
+- `filter`（`FilterParams`）：图像与 IMU 的配对条件，`require_synced_imu = true`（是否要求图像带有同步 IMU）、`max_image_imu_dt_us = 2000`（图像与 IMU 时间戳之差的上限，单位 us）。
 
 Template parameter:
 
@@ -231,7 +231,7 @@ Configuration parameters `cfg` (`Config`, `DefaultConfig()` holds all defaults):
 - `camera_calibration` (`CameraCalibrationParams`): `enabled = false`, `marker_size_mm = 25.0`, `cols = 8`, `rows = 6`, `auto_save_views = 120`.
 - `calibration_sampling` (`CalibrationSamplingParams`): `enabled = true`, `auto_start = true`, `window_size = 8`, `min_accept_interval_us = 500000`, and the hand-eye gates `max_pnp_reprojection_rms_px = 2.0`, `max_pnp_translation_jitter_m = 0.005`, `max_pnp_rotation_jitter_deg = 1.0`, `max_imu_rotation_jitter_deg = 0.8`, `max_gyro_norm_dps = 2.0`, `max_acc_norm_error_mps2 = 1.5`, `max_acc_norm_jitter_mps2 = 0.5`, `max_acc_direction_jitter_deg = 2.0`, `min_sample_translation_delta_m = 0.03`, `min_sample_rotation_delta_deg = 5.0`.
 - `control` (`ControlParams`): `stdin_enabled = false`.
-- `filter` (`FilterParams`): `require_synced_imu = true`, `max_image_imu_dt_us = 2000`.
+- `filter` (`FilterParams`): the pairing conditions of image and IMU, `require_synced_imu = true` (whether an image requires a synchronized IMU sample) and `max_image_imu_dt_us = 2000` (upper bound of the difference between the image and IMU timestamps, in us).
 
 ## 7. Topic
 
