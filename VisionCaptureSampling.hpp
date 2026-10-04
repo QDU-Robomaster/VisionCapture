@@ -49,10 +49,21 @@ enum class DatasetMode : uint8_t
 };
 
 /**
- * @brief 按显式模式选择唯一的数据采样契约。
+ * @brief 按运行模式选择数据采样方式。
+ *        Select the data sampling contract by run mode.
  *
- * `calibrate` 是 `calibrate_camera` 的兼容别名。手眼模式优先级最高，避免同时
- * 运行内参求解和手眼数据采集。
+ * @details `calibrate` 等同于 `calibrate_camera`；`calibrate_handeye`
+ *          优先于内参标定开关，只运行手眼数据采集。
+ *          `calibrate` is equivalent to `calibrate_camera`; `calibrate_handeye` takes
+ *          priority over the intrinsic calibration switch and runs the hand-eye data
+ *          collection only.
+ *
+ * @param mode 运行模式名称。
+ *             Run mode name.
+ * @param camera_calibration_enabled 是否启用相机内参标定。
+ *                                   Whether the camera intrinsic calibration is enabled.
+ * @return 数据采样方式。
+ *         The dataset mode.
  */
 inline DatasetMode ClassifyDatasetMode(std::string_view mode,
                                        bool camera_calibration_enabled)
@@ -101,7 +112,14 @@ inline bool ShouldSaveRawImu(DatasetMode mode, bool configured)
 }
 
 /**
- * @brief 内参求解只要求有效原生图像尺寸，不依赖构造期旧 K/D。
+ * @brief 判断原生图像尺寸是否有效；内参求解只需要有效的原生图像尺寸。
+ *        Check whether the native image size is valid; the intrinsic solver only needs a
+ *        valid native image size.
+ *
+ * @param calibration 原生相机标定。
+ *                    Native camera calibration.
+ * @return 宽高均非 0 时为 true。
+ *         True when both width and height are non-zero.
  */
 inline bool NativeSensorSizeUsable(const CameraTypes::CameraCalibration& calibration)
 {

@@ -32,6 +32,7 @@
 #include "VisionCaptureCalibrationQuality.hpp"
 #include "VisionCaptureRecording.hpp"
 #include "VisionCaptureSampling.hpp"
+#include "libxr_def.hpp"
 #include "logger.hpp"
 
 /**

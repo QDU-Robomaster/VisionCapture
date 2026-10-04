@@ -1,0 +1,15 @@
+name: Module CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@dev
+    with:
+      xrobot-ref: dev
+      libxr-ref: dev
+      dependency-ref: refs/heads/dev
+      template-args: '["CameraTypes::FrameLayout{.width=640,.height=480,.step=1920,.encoding=CameraTypes::Encoding::BGR8}"]'
+      image: 'ghcr.io/xrobot-org/docker-image-webots:main'
+      ctest-regex: '^vision_capture_'
