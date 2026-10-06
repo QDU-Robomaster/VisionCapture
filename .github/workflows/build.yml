@@ -7,6 +7,6 @@ jobs:
   build:
     uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@v1
     with:
-      template-args: '["CameraTypes::FrameLayout{.width=640,.height=480,.step=1920,.encoding=CameraTypes::Encoding::BGR8}"]'
-      image: 'ghcr.io/xrobot-org/docker-image-webots:main'
-      ctest-regex: '^vision_capture_'
+      template-args: '[]'
+      apt-packages: 'libeigen3-dev'
+      ctest-regex: '^vision_recorder_'

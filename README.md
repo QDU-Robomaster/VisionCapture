@@ -1,300 +1,99 @@
-# VisionCapture
+# VisionRecorder
 
-同步图像与 IMU 采集模块：记录 CameraFrameSync 输出，并完成相机内参标定与手眼标定数据采样 / Synchronized image and IMU capture Module that records the CameraFrameSync output and performs camera intrinsic calibration and hand-eye calibration sampling
+录像：把同步帧写成统一录像格式（逐帧 PGM 与 frames.csv），供回放与离线标定 / Recorder that writes synced frames in the unified recording format (per-frame PGM and frames.csv) for replay and offline calibration
 
 ## 1. 模块作用 / Purpose
 
-VisionCapture 订阅 CameraFrameSync 发布的同步图像与 IMU 数据，按运行模式保存图像和每帧元数据，并在标定模式下完成标定采样。模块用于采集与标定配置。
+VisionRecorder 订阅 `<相机名>_synced`，把每帧的原始 BayerRG8 图像、帧几何和同步的 IMU 写到磁盘。回调只把字节复制进模块自己的环形缓冲，写盘在单独的线程里进行；缓冲满时丢帧并计数，不会拖慢采集。模块不持有图像句柄，不占相机的图像槽。录下的目录可以直接交给 CaptureFileCamera 回放，也是离线标定工具的输入。
 
-运行模式：
+VisionRecorder subscribes to `<camera>_synced` and writes each frame's raw BayerRG8 image, frame geometry and synced IMU to disk. The callback only copies the bytes into the Module's own ring buffer and a separate thread writes them; when the buffer is full frames are dropped and counted, so capture is never slowed. No image handle is kept, so no camera image slot is held. A recorded directory replays directly in CaptureFileCamera and is the input of the offline calibration tools.
 
-- `record`：保存同步图像和每帧元数据。
-- `calibrate_camera`：判稳后保存标定样本，并用同一批图像求解相机内参。
-- `calibrate_handeye`：判稳后保存手眼标定样本，仅采集手眼标定数据。
-- `calibrate`：`calibrate_camera` 的别名，运行相机内参标定。
+## 2. 录像格式 / Recording Format
 
-`record` 配合 `camera_calibration.enabled: true` 也进入内参标定。`calibrate_handeye` 的优先级高于该开关，只运行手眼数据采集。
+每次启动在 `output_dir` 下新建一个以本地时间命名的目录（如 `20261006-222401`）：
 
-图像检测、预览和写盘在模块自己的工作线程中执行，CameraFrameSync 的发布线程不受影响。`VisionCapture` 在上游停止发布之后析构。输入图像支持 BGR8、RGB8、BGRA8、RGBA8 和 MONO8。工作线程、帧队列、析构顺序和求解写盘的实现细节见 [docs/internals.md](docs/internals.md)。
-
-`OnMonitor()` 打印自上次调用以来的帧数、保存数、检测到标定板的帧数、PnP 成功数、接受与拒绝的样本数、队列丢弃数，以及当前模式和采样状态。
-
-VisionCapture subscribes to the synchronized image and IMU data published by CameraFrameSync, saves the images and the per-frame metadata according to the run mode, and performs the calibration sampling in the calibration modes. The Module is used in capture and calibration configurations.
-
-Run modes:
-
-- `record`: saves the synchronized images and the per-frame metadata.
-- `calibrate_camera`: saves calibration samples after the stability check and solves the camera intrinsics from the same images.
-- `calibrate_handeye`: saves hand-eye calibration samples after the stability check and only collects the hand-eye calibration data.
-- `calibrate`: alias of `calibrate_camera`, runs the camera intrinsic calibration.
-
-`record` together with `camera_calibration.enabled: true` also enters the intrinsic calibration. `calibrate_handeye` takes priority over that switch and runs the hand-eye data collection only.
-
-Image detection, preview and disk writing run on a worker thread owned by the Module, so the publishing thread of CameraFrameSync is unaffected. `VisionCapture` is destroyed after the upstream publishing has stopped. The input images support BGR8, RGB8, BGRA8, RGBA8 and MONO8. The implementation details of the worker thread, the frame queue, the destruction order and the solve-and-write run are in [docs/internals.md](docs/internals.md).
-
-`OnMonitor()` prints the frame count, the saved count, the number of frames with a detected board, the PnP success count, the accepted and rejected sample counts and the queue drop count since the previous call, together with the current mode and sampling status.
-
-## 2. 记录内容 / Records
-
-记录目录为 `<output_dir>/<session_name>`。`session_name` 为空时，模块生成 `vision_capture_<YYYYmmdd_HHMMSS>` 作为目录名。
-
-`record` 模式按 `record.*` 配置保存。标定模式固定保存通过判稳的样本：记录、图像和元数据强制打开，帧率不受限，与 `record.enabled` 无关；被判稳拒绝的帧不写入 `frames/` 和 `samples.csv`。标定模式下 `calibration_sampling.enabled` 为 `false` 时，帧以 `sampling_disabled` 拒绝。
-
-输出内容：
-
-- `samples.csv`：同步图像时间戳、IMU 时间戳、可选原始 IMU、图像文件名、标定板检测结果和采样判定。
-- `frame_geometry.csv`：每个成功记录帧的完整 ROI、下采样、翻转、保留字段和采样相位，可区分混合 WIDE / NARROW 记录。
-- `frames/`：保存的原始图像，格式由 `record.image_format` 决定。
-- `frame_layout.txt`：编译期固定的帧存储布局。
-- `camera_calibration.txt`：原生传感器坐标系下的固定标定。
-- `frame_geometry.txt`：首个有效帧的 ROI、下采样、翻转和采样相位。
-- `camera_info.txt`：由 `frame_layout.txt`、`camera_calibration.txt` 和 `frame_geometry.txt` 派生的帧坐标快照。
-- 预览：可选的窗口或 Web 预览（见 VisionPreview），显示被拒绝的帧、检测与重投影点、判定原因、视觉覆盖、采样与求解进度以及当前帧的 geometry / profile。
-
-记录细节：
-
-- 手眼模式写入原始 IMU，与 `save_raw_imu` 无关；内参模式和 `record` 模式按 `save_raw_imu` 决定。
-- 图像写盘失败的帧不写入两个 CSV，也不计入已保存帧数。
-- `save_raw_imu: false` 时 `samples.csv` 保持固定列结构，十个原始 IMU 数值单元格留空。
-- `flush_every_n: 0` 表示只在文件流关闭时刷盘，否则每成功记录指定行数后同时刷新两个 CSV。
-- 相机和 MCU 时间戳属于不同时间域，`samples.csv` 分别保存两者，`dt_us` 列为空；原始加速度遵循 `CameraBase::ImuStamped` 的 `m/s^2` 约定，单位记录在末列。
-- 任一必需记录或 CSV 刷盘失败时，本次会话记为失败，`solve` 不再返回 PASS。
-
-The record directory is `<output_dir>/<session_name>`. When `session_name` is empty the Module generates `vision_capture_<YYYYmmdd_HHMMSS>` as the directory name.
-
-The `record` mode saves according to the `record.*` configuration. The calibration modes always save the samples that pass the stability check: recording, images and metadata are forced on and the frame rate is unlimited, independent of `record.enabled`; frames rejected by the stability check are not written to `frames/` and `samples.csv`. In the calibration modes, frames are rejected with `sampling_disabled` when `calibration_sampling.enabled` is `false`.
-
-Outputs:
-
-- `samples.csv`: synchronized image timestamp, IMU timestamp, optional raw IMU, image file name, board detection result and sampling decision.
-- `frame_geometry.csv`: the complete ROI, downsampling, flip, reserved fields and sampling phase of every successfully recorded frame, which distinguishes mixed WIDE / NARROW records.
-- `frames/`: the saved raw images, in the format given by `record.image_format`.
-- `frame_layout.txt`: the frame storage layout fixed at compile time.
-- `camera_calibration.txt`: the fixed calibration in the native sensor coordinate system.
-- `frame_geometry.txt`: ROI, downsampling, flip and sampling phase of the first valid frame.
-- `camera_info.txt`: frame-coordinate snapshot derived from `frame_layout.txt`, `camera_calibration.txt` and `frame_geometry.txt`.
-- Preview: optional window or Web preview (see VisionPreview), showing rejected frames, detected and reprojected points, the decision reason, visual coverage, sampling and solving progress and the geometry / profile of the current frame.
-
-Record details:
-
-- The hand-eye mode writes the raw IMU regardless of `save_raw_imu`; the intrinsic mode and the `record` mode follow `save_raw_imu`.
-- Frames whose image write fails are not written to the two CSV files and are not counted as saved frames.
-- With `save_raw_imu: false`, `samples.csv` keeps its fixed column layout and the ten raw IMU value cells are left empty.
-- `flush_every_n: 0` flushes only when the file stream is closed; otherwise both CSV files are flushed after every given number of successfully recorded rows.
-- Camera and MCU timestamps belong to different time domains; `samples.csv` stores both and the `dt_us` column is empty. The raw acceleration follows the `m/s^2` convention of `CameraBase::ImuStamped`, and the unit is recorded in the last column.
-- When any required record or CSV flush fails, the session is marked as failed and `solve` no longer returns PASS.
-
-## 3. 相机内参标定 / Camera Intrinsic Calibration
-
-两个标定模式使用 GShang 25 mm、8x6 标定板和 ArUco original 字典；`board.*` 用于 `record` 模式的检测。内参标定器接收通过纯视觉门限的图像，仅使用图像上的视觉观测。
-
-配置项：
-
-- `camera_calibration.marker_size_mm`、`cols`、`rows`：标定模式把它们规范为 `25.0` / `8` / `6`，取值不同时打印警告。
-- `camera_calibration.auto_save_views`：接受的视角数达到该值后自动求解并保存结果；`0` 表示由 `solve` 命令触发。
-
-输出目录（相对进程工作目录）：
+Each start creates a directory named by local time (such as `20261006-222401`) under `output_dir`:
 
 ```text
-runs/camera_calib/<timestamp>_<session>_<marker>mm_<cols>x<rows>/
+session.txt   相机名与第一帧携带的标定（回放不读）/ camera name and the calibration of the first frame (not read by replay)
+frames.csv    frame,timestamp_us,frame_counter,roi_x,roi_y,decimation,qw,qx,qy,qz,gx,gy,gz,ax,ay,az
+000000.pgm    640×512 P5 8 位 BayerRG8，(0,0) 为 R / 8-bit BayerRG8, R at (0,0)
+000001.pgm
+…
 ```
 
-输出内容：
+`frame` 从 0 连续编号，对应 PGM 文件名；`timestamp_us` 是图像的传感器时间，IMU 是 CFS 配给这一帧的样本（四元数为本体系到世界系，角速度 rad/s，加速度 m/s²，本体系 x 右、y 前、z 上）。浮点按 9 位有效数字写，读回与原值逐位相同。
 
-- `calibration.yml`
-- `views.csv`
-- `quality_report.txt`
-- `camera_info_snippet.txt`
-- `debug/`：调试图像
+`frame` counts from 0 without gaps and names the PGM file; `timestamp_us` is the image's sensor time, and the IMU is the sample CFS paired with the frame (body-to-world quaternion, rad/s, m/s², body x right, y forward, z up). Floats are written with nine significant digits and read back bit for bit.
 
-`camera_info_snippet.txt` 是可粘贴到 BSP `User/xrobot.yaml` 的 `constexprs` 片段，包含 `MainFrameLayout`（`CameraTypes::FrameLayout`）与原生 `MainCameraCalibration`（`CameraTypes::CameraCalibration`），值以 YAML map 写出。原生尺寸、焦距、主点、畸变系数与 `quality_report.txt` 中的重投影 RMS 用于判断结果是否可用。离群阈值、`rms`、`views.csv` 和质量报告中的重投影误差使用当前帧像素，`calibration.yml` 另存 `native_rms` 供原生坐标诊断。
-
-`quality_ok` 要求视角数、中心与尺度覆盖、最终外参恢复出的双轴标定板倾斜跨度、内参合理性以及全局与逐视角重投影误差全部通过，且所有输出写入成功，求解才返回成功并生成 `calibration.yml` 与 `camera_info_snippet.txt`。质量未通过时只保留 `views.csv` 和 `quality_report.txt`。
-
-Both calibration modes use the GShang 25 mm, 8x6 board and the ArUco original dictionary; `board.*` is used for the detection in the `record` mode. The intrinsic calibrator receives the images that pass the pure vision gates and uses only the visual observations in the images.
-
-Configuration:
-
-- `camera_calibration.marker_size_mm`, `cols` and `rows`: the calibration modes normalize them to `25.0` / `8` / `6` and print a warning when the values differ.
-- `camera_calibration.auto_save_views`: once the number of accepted views reaches this value, the result is solved and saved automatically; `0` means the `solve` command triggers it.
-
-Output directory (relative to the process working directory) as in the code block above.
-
-Outputs:
-
-- `calibration.yml`
-- `views.csv`
-- `quality_report.txt`
-- `camera_info_snippet.txt`
-- `debug/`: debug images
-
-`camera_info_snippet.txt` is a `constexprs` snippet that can be pasted into the BSP `User/xrobot.yaml`. It contains `MainFrameLayout` (`CameraTypes::FrameLayout`) and the native `MainCameraCalibration` (`CameraTypes::CameraCalibration`), with the values written as YAML maps. The native size, focal lengths, principal point, distortion coefficients and the reprojection RMS in `quality_report.txt` serve to judge whether the result is usable. The outlier thresholds, `rms`, `views.csv` and the reprojection errors in the quality report use current-frame pixels, and `calibration.yml` additionally stores `native_rms` for diagnostics in native coordinates.
-
-`quality_ok` requires the view count, the center and scale coverage, the dual-axis board tilt span recovered from the final extrinsics, the intrinsic plausibility and the global and per-view reprojection errors all to pass, and every output has to be written successfully; only then does the solve return success and generate `calibration.yml` and `camera_info_snippet.txt`. When the quality check fails, only `views.csv` and `quality_report.txt` are kept.
-
-## 4. 采样判稳 / Sampling Stability
-
-内参模式检查 GShang marker 数、单应性 RMS、清晰度、相机时间戳间隔，以及中心、尺度和角度的视觉重复。
-
-手眼模式使用冻结的原生 K / D 执行畸变感知 PnP，并检查：
-
-- PnP 重投影 RMS。
-- PnP 平移和旋转抖动。
-- IMU 四元数抖动。
-- 陀螺仪模长。
-- 加速度模长（与 9.80665 m/s^2 比较）、模长抖动和方向抖动。
-- 样本之间的时间间隔、位移和角度变化。
-
-手眼输入需要非零 MCU 时间戳、有限且可归一化的四元数、有限角速度和有限的 `m/s^2` 加速度。约为 `1.0` 的 `g` 量纲输入以 `acc_unit_or_scale` 拒绝。采样结果决定 `frames/` 和 `samples.csv` 保存哪些样本；手眼模式采集手眼数据。
-
-The intrinsic mode checks the number of GShang markers, the homography RMS, the sharpness, the camera timestamp interval and the visual repetition of center, scale and angle.
-
-The hand-eye mode runs a distortion-aware PnP with the frozen native K / D and checks:
-
-- the PnP reprojection RMS;
-- the PnP translation and rotation jitter;
-- the IMU quaternion jitter;
-- the gyroscope norm;
-- the acceleration norm (compared with 9.80665 m/s^2), its jitter and its direction jitter;
-- the time interval, displacement and angle change between samples.
-
-Hand-eye input requires a non-zero MCU timestamp, a finite and normalizable quaternion, a finite angular velocity and a finite acceleration in `m/s^2`. Input in `g` units, with a norm of about `1.0`, is rejected with `acc_unit_or_scale`. The sampling result decides which samples are saved to `frames/` and `samples.csv`; the hand-eye mode collects the hand-eye data.
-
-## 5. 本地命令 / Local Commands
-
-`control.stdin_enabled: true` 时，标准输入接受以下命令：
-
-- `start`：开始采样（`calibration_sampling.auto_start: true` 时启动即开始）。
-- `pause` / `stop`：暂停采样。
-- `reset`：清空判稳窗口、已接受样本、求解器视角和完成状态。
-- `snapshot`：请求强制接受下一帧通过质量门限的样本（跳过间隔和重复检查）；被拒绝的帧不消费请求，处理当前帧期间到达的新请求保留到后续帧。
-- `status`：打印当前采样状态。
-- `solve`：内参模式立即尝试求解；手眼模式打印当前样本数。
-- `help`：打印命令列表。
-
-With `control.stdin_enabled: true` the standard input accepts the following commands:
-
-- `start`: starts sampling (sampling starts at launch when `calibration_sampling.auto_start: true`).
-- `pause` / `stop`: pauses sampling.
-- `reset`: clears the stability window, the accepted samples, the solver views and the completion state.
-- `snapshot`: requests that the next frame passing the quality gates is accepted by force (the interval and duplicate checks are skipped); rejected frames do not consume the request, and a new request that arrives while a frame is being processed stays pending for a later frame.
-- `status`: prints the current sampling status.
-- `solve`: the intrinsic mode tries to solve immediately; the hand-eye mode prints the current sample count.
-- `help`: prints the command list.
-
-## 6. 构造接口 / Constructor
-
-```cpp
-template <CameraTypes::FrameLayout FrameLayoutV>
-class VisionCapture;
-
-VisionCapture(Sync& sync, Config cfg = DefaultConfig());
-```
-
-模板参数：
-
-- `FrameLayoutV`：帧布局，与上游 CameraFrameSync 和相机的帧布局相同。
-
-依赖：
-
-- `sync`：`CameraFrameSync<FrameLayoutV>&`，上游的 CameraFrameSync 实例；模块订阅其 `SyncedFrameTopicName()` 并复制其原生标定。
-
-配置参数 `cfg`（`Config`，`DefaultConfig()` 为全部默认值）：
-
-- `mode`：`"record"`（默认）、`"calibrate_camera"`、`"calibrate_handeye"` 或 `"calibrate"`。
-- `output_dir`：输出根目录，默认 `"runs/vision_capture"`。
-- `session_name`：会话名，默认为空（自动生成）。
-- `record`（`RecordParams`）：`enabled = true`、`image_format = "bmp"`、`max_fps = 30.0`（0 为不限）、`max_frames = 0`（0 为不限）、`save_images = true`、`save_metadata = true`、`save_raw_imu = true`、`flush_every_n = 1`。
-- `preview`（`VisionPreview::RuntimeParam`）：默认关闭，字段见 VisionPreview。
-- `board`（`BoardParams`）：`record` 模式的检测参数，`type = "aruco"`、`dictionary = "DICT_5X5_100"`、`marker_length_m = 0.04`。
-- `camera_calibration`（`CameraCalibrationParams`）：`enabled = false`、`marker_size_mm = 25.0`、`cols = 8`、`rows = 6`、`auto_save_views = 120`。
-- `calibration_sampling`（`CalibrationSamplingParams`）：`enabled = true`、`auto_start = true`、`window_size = 8`、`min_accept_interval_us = 500000`，以及手眼门限 `max_pnp_reprojection_rms_px = 2.0`、`max_pnp_translation_jitter_m = 0.005`、`max_pnp_rotation_jitter_deg = 1.0`、`max_imu_rotation_jitter_deg = 0.8`、`max_gyro_norm_dps = 2.0`、`max_acc_norm_error_mps2 = 1.5`、`max_acc_norm_jitter_mps2 = 0.5`、`max_acc_direction_jitter_deg = 2.0`、`min_sample_translation_delta_m = 0.03`、`min_sample_rotation_delta_deg = 5.0`。
-- `control`（`ControlParams`）：`stdin_enabled = false`。
-- `filter`（`FilterParams`）：图像与 IMU 的配对条件，`require_synced_imu = true`（是否要求图像带有同步 IMU）、`max_image_imu_dt_us = 2000`（图像与 IMU 时间戳之差的上限，单位 us）。
-
-Template parameter:
-
-- `FrameLayoutV`: the frame layout, equal to the frame layout of the upstream CameraFrameSync and the camera.
-
-Dependencies:
-
-- `sync`: `CameraFrameSync<FrameLayoutV>&`, the upstream CameraFrameSync instance; the Module subscribes to its `SyncedFrameTopicName()` and copies its native calibration.
-
-Configuration parameters `cfg` (`Config`, `DefaultConfig()` holds all defaults):
-
-- `mode`: `"record"` (default), `"calibrate_camera"`, `"calibrate_handeye"` or `"calibrate"`.
-- `output_dir`: output root directory, default `"runs/vision_capture"`.
-- `session_name`: session name, default empty (generated automatically).
-- `record` (`RecordParams`): `enabled = true`, `image_format = "bmp"`, `max_fps = 30.0` (0 is unlimited), `max_frames = 0` (0 is unlimited), `save_images = true`, `save_metadata = true`, `save_raw_imu = true`, `flush_every_n = 1`.
-- `preview` (`VisionPreview::RuntimeParam`): disabled by default, fields see VisionPreview.
-- `board` (`BoardParams`): detection parameters of the `record` mode, `type = "aruco"`, `dictionary = "DICT_5X5_100"`, `marker_length_m = 0.04`.
-- `camera_calibration` (`CameraCalibrationParams`): `enabled = false`, `marker_size_mm = 25.0`, `cols = 8`, `rows = 6`, `auto_save_views = 120`.
-- `calibration_sampling` (`CalibrationSamplingParams`): `enabled = true`, `auto_start = true`, `window_size = 8`, `min_accept_interval_us = 500000`, and the hand-eye gates `max_pnp_reprojection_rms_px = 2.0`, `max_pnp_translation_jitter_m = 0.005`, `max_pnp_rotation_jitter_deg = 1.0`, `max_imu_rotation_jitter_deg = 0.8`, `max_gyro_norm_dps = 2.0`, `max_acc_norm_error_mps2 = 1.5`, `max_acc_norm_jitter_mps2 = 0.5`, `max_acc_direction_jitter_deg = 2.0`, `min_sample_translation_delta_m = 0.03`, `min_sample_rotation_delta_deg = 5.0`.
-- `control` (`ControlParams`): `stdin_enabled = false`.
-- `filter` (`FilterParams`): the pairing conditions of image and IMU, `require_synced_imu = true` (whether an image requires a synchronized IMU sample) and `max_image_imu_dt_us = 2000` (upper bound of the difference between the image and IMU timestamps, in us).
-
-## 7. Topic
-
-| Topic | 方向 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| `sync.SyncedFrameTopicName()` | 订阅 | `SyncedFrameTopicPayload` | CameraFrameSync 发布的同步图像与 IMU 数据 |
-
-| Topic | Direction | Type | Meaning |
-| --- | --- | --- | --- |
-| `sync.SyncedFrameTopicName()` | Subscribe | `SyncedFrameTopicPayload` | Synchronized image and IMU data published by CameraFrameSync |
-
-## 8. 配置示例 / Configuration Example
-
-`xrobot instance add QDU-Robomaster/VisionCapture --template-arg <FrameLayout>` 写入的实例：`template_args` 引用 `constexprs` 中定义的帧布局，`sync` 填写为 CameraFrameSync 实例的 id，`cfg` 为工具写入的 C++ 表达式 `DefaultConfig()`，各字段取第 6 节列出的默认值。
-
-The instance written by `xrobot instance add QDU-Robomaster/VisionCapture --template-arg <FrameLayout>`: `template_args` refers to a frame layout defined in `constexprs`, `sync` is set to the id of a CameraFrameSync instance, and `cfg` is the C++ expression `DefaultConfig()` written by the tool, whose fields take the defaults listed in section 6.
+## 3. 配置示例 / Configuration Example
 
 ```yaml
-constexpr_namespace: AutoAimRunConfig
-constexpr_includes:
-  - CameraBase.hpp
-constexprs:
-  HikFrameLayout:
-    type: CameraTypes::FrameLayout
-    value: '{.width = 720, .height = 540, .step = 2160, .encoding = CameraTypes::Encoding::BGR8}'
 modules:
-  - module: QDU-Robomaster/VisionCapture
-    id: vision_capture
-    template_args:
-      - AutoAimRunConfig::HikFrameLayout
+  - module: QDU-Robomaster/VisionRecorder
+    id: recorder
     args:
-      - sync: camera_frame_sync
-      - cfg: VisionCapture<AutoAimRunConfig::HikFrameLayout>::DefaultConfig()
+      - settings:
+          camera_name: "gimbal"
+          record: true
+          output_dir: "/home/robot/recordings"
+          max_fps: 0
+          max_frames: 0
+          buffer_frames: 32
 ```
 
-`Config` 带有多个构造函数，`cfg` 写成 YAML map 时，键为其中一个构造函数的参数名（`mode_in`、`output_dir_in`、`session_name_in`、`record_in`、`preview_in`、`board_in`、`camera_calibration_in`、`calibration_sampling_in`、`control_in`、`filter_in`，其中 `calibration_sampling_in` 与 `control_in` 可成组省略），子结构按字段名写 map，字段名见第 6 节。被引用的 CameraFrameSync 实例列在本实例之前，并使用相同的 `template_args`。
+`record` 为 false 时模块不订阅也不写盘。`max_fps` 为 0 时每帧都存，否则按图像时间限速（例如 100 Hz 输入、上限 50 时隔帧保存）。`max_frames` 为 0 时不限帧数。每个缓冲帧约 0.33 MB。
 
-`Config` has several constructors; when `cfg` is written as a YAML map, the keys are the parameter names of one of them (`mode_in`, `output_dir_in`, `session_name_in`, `record_in`, `preview_in`, `board_in`, `camera_calibration_in`, `calibration_sampling_in`, `control_in`, `filter_in`, where `calibration_sampling_in` and `control_in` can be omitted as a group), and sub-structures are written as maps by field name, with the field names in section 6. The referenced CameraFrameSync instance is listed before this instance and uses the same `template_args`.
+With `record` false the Module neither subscribes nor writes. With `max_fps` 0 every frame is kept; otherwise frames are thinned by image time (100 Hz in with a cap of 50 keeps every other frame). `max_frames` 0 means no limit. Each buffered frame takes about 0.33 MB.
 
-## 9. 依赖与硬件 / Dependencies and Hardware
+## 4. 离线标定 / Offline Calibration
 
-依赖：
+`tools/` 下的脚本在录像上做标定，需要 Python 3.10+、NumPy 与 OpenCV（含 aruco）。标定板为 GShang 板：8×6 个棋盘格，白格中印 DICT_ARUCO_ORIGINAL marker，marker 边长 25 mm（棋盘格 32.14 mm）。工具用 marker 识别出板，再取棋盘格的内角点（鞍点）求解；每帧按自己的几何换算到原生像素，所以 WIDE 与 NARROW 的录像可以混用。
 
-- `QDU-Robomaster/CameraFrameSync`：同步帧输入（`SyncedFrame`）和原生标定。
-- `QDU-Robomaster/VisionPreview`：预览输出。
-- `QDU-Robomaster/CameraBase`：帧布局、geometry 与共享图像类型。
-- OpenCV 4（`core`、`imgproc`、`imgcodecs`、`calib3d`、`aruco`）。
-- LibXR。
+The scripts under `tools/` calibrate on recordings and need Python 3.10+, NumPy and OpenCV (with aruco). The board is the GShang board: 8×6 chessboard squares with DICT_ARUCO_ORIGINAL markers printed in the white squares, 25 mm markers (32.14 mm squares). The tools identify the board by its markers and solve with the inner chessboard corners (saddle points); each frame is mapped to native pixels by its own geometry, so WIDE and NARROW recordings can be mixed.
 
-硬件：由 CameraFrameSync 同步的相机与 IMU。
+### 4.1 内参 / Intrinsics
 
-Dependencies:
+录一段手持标定板在相机前移动的录像：板要覆盖画面四角与中间，并有 30–45° 的倾斜；距离以 marker 在画面上不小于约 15 像素为宜。
 
-- `QDU-Robomaster/CameraFrameSync`: synchronized frame input (`SyncedFrame`) and the native calibration.
-- `QDU-Robomaster/VisionPreview`: preview output.
-- `QDU-Robomaster/CameraBase`: frame layout, geometry and shared image types.
-- OpenCV 4 (`core`, `imgproc`, `imgcodecs`, `calib3d`, `aruco`).
-- LibXR.
+Record the board held in front of the camera and moved around: cover the corners and the centre of the view and include tilts of 30–45°; keep markers at least about 15 pixels wide in the image.
 
-Hardware: the camera and the IMU synchronized by CameraFrameSync.
+```bash
+python tools/calibrate_intrinsics.py <录像目录> --out intrinsics.yaml
+```
 
-## 10. 测试 / Tests
+输出 `intrinsics.yaml`（`native_width`、`native_height`、`fx`、`fy`、`cx`、`cy`、`distortion`）并打印可粘贴的 `CameraTypes::CameraCalibration` 初始化式，以及 fx、fy、cx、cy 的标准差。焦距标准差超过 0.5% 时会给出警告，说明视角不够多样，需要补录倾斜的视角。8 mm 等窄视场镜头可加 `--fix-k3`。
 
-在启用 `BUILD_TESTING` 的 BSP 构建中，模块加入 `vision_capture_calibration_geometry_test`，用 `ctest` 运行。
+It writes `intrinsics.yaml` (`native_width`, `native_height`, `fx`, `fy`, `cx`, `cy`, `distortion`) and prints a `CameraTypes::CameraCalibration` initializer to paste, together with the standard deviations of fx, fy, cx and cy. A focal standard deviation above 0.5% produces a warning that the views lack variety and tilted views should be added. Narrow lenses such as 8 mm can add `--fix-k3`.
 
-In a BSP build with `BUILD_TESTING` enabled, the Module adds `vision_capture_calibration_geometry_test`, run with `ctest`.
+### 4.2 相机安装（手眼）/ Camera Mounting (Hand-Eye)
+
+标定板固定不动；云台依次转到不同的偏航、俯仰（彼此相差 5° 以上，总跨度 10° 以上），每个姿态停住约半秒。录像需要带 IMU 列（CFS 的同步帧都带）。
+
+Fix the board; turn the gimbal through different yaw and pitch attitudes (at least 5° apart, spanning more than 10°) and hold each for about half a second. The recording needs the IMU columns, which every CFS synced frame carries.
+
+```bash
+python tools/calibrate_handeye.py <录像目录> --intrinsics intrinsics.yaml --out mount.yaml
+```
+
+工具按陀螺找出静止段，每段取中间一帧求板的位姿，先用 `cv2.calibrateRobotWorldHandEye` 得到初值，再把所有姿态的重投影误差一起最小化（单帧位姿的倾角误差约 1°，在这一步被平均掉）。输出 ArmorTracker 的 `mount_rotation_wxyz` 与 `mount_translation`；云台绕固定点转动时平移只能粗略确定，旋转是主要结果。
+
+The tool finds still segments from the gyro and solves the board pose in the middle frame of each, takes `cv2.calibrateRobotWorldHandEye` as the start, then minimises the reprojection error of all poses together (the tilt error of a single-frame pose, about 1°, averages out there). It writes ArmorTracker's `mount_rotation_wxyz` and `mount_translation`; with the gimbal rotating about a fixed point the translation is only roughly determined, and the rotation is the main result.
+
+### 4.3 合成检查 / Synthetic Check
+
+`python tools/test_tools.py` 按已知内参与安装渲染标定板录像，再用两个工具解回来：内参 60 个视角（WIDE 与 NARROW 混合）解出的焦距误差约 0.2%、主点误差约 3 像素、畸变在画面内造成的位移小于 0.4 像素；手眼 15 个姿态解出的安装旋转误差约 0.02°。
+
+`python tools/test_tools.py` renders board recordings with known intrinsics and mounting and solves them back with both tools: 60 views (WIDE and NARROW mixed) give the focal length within about 0.2%, the principal point within about 3 pixels and a distortion displacement below 0.4 pixels over the view; 15 poses give the mount rotation within about 0.02°.
+
+## 5. 测试 / Tests
+
+`tests/recorder_test.cpp` 检查 frames.csv 的表头与内容、PGM 的头与像素、session.txt、50 fps 上限（100 Hz 输入存一半）与帧数上限。
+
+`tests/recorder_test.cpp` checks the frames.csv header and rows, the PGM header and pixels, session.txt, the 50 fps cap (half of a 100 Hz input) and the frame limit.
+
+## 6. 依赖 / Dependencies
+
+AutoAimTypes（含 CameraBase）、LibXR。离线工具另需 Python、NumPy、OpenCV。
+
+AutoAimTypes (with CameraBase), LibXR. The offline tools also need Python, NumPy and OpenCV.
