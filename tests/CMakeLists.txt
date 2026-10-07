@@ -1,9 +1,5 @@
-add_executable(vision_capture_calibration_geometry_test
-               calibration_geometry_test.cpp)
-
-target_link_libraries(vision_capture_calibration_geometry_test PRIVATE xr)
-target_compile_features(vision_capture_calibration_geometry_test
-                        PRIVATE cxx_std_20)
-
-add_test(NAME vision_capture_calibration_geometry_test
-         COMMAND vision_capture_calibration_geometry_test)
+add_executable(vision_recorder_test recorder_test.cpp)
+target_link_libraries(vision_recorder_test PRIVATE xr)
+target_compile_features(vision_recorder_test PRIVATE cxx_std_20)
+add_test(NAME vision_recorder_test COMMAND vision_recorder_test)
+set_tests_properties(vision_recorder_test PROPERTIES TIMEOUT 60)
